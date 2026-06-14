@@ -85,7 +85,7 @@ public:
 	 * per primitive. The coroutine completes only on Shutdown.
 	 * Started once by the owning subsystem.
 	 */
-	UE5Coro::TCoroutine<> TickConverge(UE5Coro::FForceLatentCoroutine = {});
+	UE5Coro::TCoroutine<> TickConverge(FForceLatentCoroutine = {});
 
 	/**
 	 * Render exactly one tile NOW (synchronous, no budget). For the compositor's

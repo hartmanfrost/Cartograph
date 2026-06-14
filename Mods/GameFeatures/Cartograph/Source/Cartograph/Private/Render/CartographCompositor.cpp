@@ -277,7 +277,7 @@ void FCartographCompositor::SetShowBuildings(bool bShow)
 // -----------------------------------------------------------------------------
 // The never-cancelled convergent loop (SPEC 4.3).
 // -----------------------------------------------------------------------------
-UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::FForceLatentCoroutine)
+UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(FForceLatentCoroutine)
 {
 	using namespace UE5Coro;
 

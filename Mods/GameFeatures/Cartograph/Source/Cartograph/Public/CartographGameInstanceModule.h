@@ -235,7 +235,7 @@ private:
 	/** O(N) streaming bucketing gather over the engine subsystems by const-ref
 	 *  (NO by-value engine-map copy, NO O(N^2), NO sort). Replaces the legacy
 	 *  InitialBuildableGather. Interruptible under the init frame budget. */
-	UE5Coro::TCoroutine<> StreamingGather(UE5Coro::FForceLatentCoroutine = {});
+	UE5Coro::TCoroutine<> StreamingGather(FForceLatentCoroutine = {});
 
 	/** Drive the server-side per-tile repack + delta push once per net-tick.
 	 *  No-op on listen host / single-player (no network path). */

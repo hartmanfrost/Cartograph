@@ -421,6 +421,9 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 		// tile's clip is a separate command buffer (the TDR fix, SPEC 4.2). It is only
 		// meaningful for the TiledCanvas backend; the Slate/instance backends never
 		// open this FCanvas, so GetScissorForCanvas returns false and the hook is inert.
+		// Alias std::array<uint32, 4> here: a bare comma inside the lambda below would
+		// split the SUBSCRIBE_METHOD function-like-macro argument and fail to compile.
+		using FScissorRect = std::array<uint32, 4>;
 		SUBSCRIBE_METHOD(FCanvas::GetBatchedElements,
 			[](auto& Scope, FCanvas* ClassInstance,
 				FCanvas::EElementType InElementType, FBatchedElementParameters* InBatchedElementParameters, const FTexture* InTexture, ESimpleElementBlendMode InBlendMode, const FDepthFieldGlowInfo& GlowInfo, bool bApplyDPIScale)
@@ -430,7 +433,7 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 				{
 					return;
 				}
-				std::array<uint32, 4> _ScissorUnused;
+				FScissorRect _ScissorUnused;
 				if (!Instance->Compositor.GetScissorForCanvas(ClassInstance, _ScissorUnused))
 				{
 					return;
@@ -1031,7 +1034,7 @@ FBuildingHandle UCartographGameInstanceModule::FindHandleForRemoval(
 // =============================================================================
 // O(N) const-ref streaming gather (replaces the O(N^2)/by-value gather).
 // =============================================================================
-UE5Coro::TCoroutine<> UCartographGameInstanceModule::StreamingGather(UE5Coro::FForceLatentCoroutine)
+UE5Coro::TCoroutine<> UCartographGameInstanceModule::StreamingGather(FForceLatentCoroutine)
 {
 	UWorld* World = GetWorld();
 	if (!World)
