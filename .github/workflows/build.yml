@@ -16,14 +16,13 @@ name: Build Cartograph
 #   ref: https://raw.githubusercontent.com/satisfactorymodding/SatisfactoryModLoader/master/.github/workflows/build.yml
 # ---------------------------------------------------------------------------
 
+# Auto-triggers (push / pull_request) are intentionally DISABLED: push and PR
+# builds now run on the ash k3s cluster via the Argo Workflows + Argo Events
+# pipeline (GitHub App webhook -> github EventSource -> Sensor -> build-cartograph).
+# This Actions workflow is retained ONLY as a manual, self-hosted-runner fallback
+# to avoid double-building every commit. See the ash repo docs/CARTOGRAPH-CI.md.
 on:
-  push:
-    branches: [ "Cartograph", "cartograph-rearch" ]   # default branch + the re-architecture branch
-    paths-ignore:
-      - "**/*.md"                          # docs-only edits do not need a 40+ min UE build
-      - ".gitignore"
-  pull_request:                            # validate that PRs still compile/package
-  workflow_dispatch:                       # manual "build a release" button
+  workflow_dispatch:                       # manual "build a release" button (self-hosted runner)
 
 # Cancel an in-flight build when a newer commit lands on the same branch/PR.
 # github.ref already disambiguates branches (refs/heads/*) and PRs (refs/pull/N/merge),
