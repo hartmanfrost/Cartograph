@@ -1,9 +1,8 @@
-﻿#pragma once
+#pragma once
 
 #include <array>
 
 #include "CoreMinimal.h"
-#include "GenericQuadTree.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "Module/GameInstanceModule.h"
 
@@ -12,32 +11,36 @@
 
 #include "UE5Coro/UE5Coro.h"
 
-#include "CartographDataStructure.h"
+// World bounds, RENDER_TEXTURE_SIZE, ORIGIN_UV, PIXEL_PER_CENTIMETER, SPLINE_SEGMENTS,
+// grid/tile/Z-band geometry and the render-backend CVars now live in the FROZEN
+// CartographConfig.h (SPEC). The legacy duplicates that used to be declared HERE
+// (with a DIFFERENT RENDER_TEXTURE_SIZE = 8192) were an ODR/redefinition conflict
+// with CartographConfig.h's 4096 in any TU that included both (CartographClassDrawTable.cpp,
+// CartographCompositor.cpp, CartographMapReplicator.cpp all do). They are deleted
+// here and this header now includes the single authority. (Integration reconcile.)
+#include "CartographConfig.h"
+
+// The slim spine + render/net subsystems owned by this module post-rearchitecture.
+#include "Core/CartographTypes.h"
+#include "Core/CartographBuildingStore.h"
+#include "Core/CartographSpatialGrid.h"
+#include "Core/CartographZBandIndex.h"
+#include "Core/CartographClassDrawTable.h"
+#include "Core/CartographTileManager.h"
+#include "Render/CartographCompositor.h"
+#include "Net/CartographMapReplicator.h"
 
 #include "CartographGameInstanceModule.generated.h"
 
 
 class AFGBuildable;
+class AFGBuildableSubsystem;
 class AFGLightweightBuildableSubsystem;
 class UCanvasRenderTarget2D;
 class UFGBuildCategory;
 class UFGBuildSubCategory;
 class UFGBuildingDescriptor;
-
-
-constexpr double WEST_BOUND_CENTIMETERS = -324698.832031;
-constexpr double EAST_BOUND_CENTIMETERS = 425301.832031;
-constexpr double NORTH_BOUND_CENTIMETERS = -375000;
-constexpr double SOUTH_BOUND_CENTIMETERS = 375000;
-constexpr double MAP_WIDTH_CENTIMETERS = EAST_BOUND_CENTIMETERS - WEST_BOUND_CENTIMETERS;
-constexpr double MAP_HEIGHT_CENTIMETERS = SOUTH_BOUND_CENTIMETERS - NORTH_BOUND_CENTIMETERS;
-
-constexpr int RENDER_TEXTURE_SIZE = 1024 * 8;
-
-constexpr double ORIGIN_UV[] = { -WEST_BOUND_CENTIMETERS / MAP_WIDTH_CENTIMETERS, -NORTH_BOUND_CENTIMETERS / MAP_HEIGHT_CENTIMETERS };
-constexpr double PIXEL_PER_CENTIMETER[] = { RENDER_TEXTURE_SIZE / MAP_WIDTH_CENTIMETERS, RENDER_TEXTURE_SIZE / MAP_HEIGHT_CENTIMETERS };
-
-constexpr int SPLINE_SEGMENTS = 8;
+struct FRuntimeBuildableInstanceData;
 
 
 DECLARE_LOG_CATEGORY_EXTERN(LogCartograph, Display, All);
@@ -62,6 +65,14 @@ constexpr bool DRAW_BOUNDARIES = false;
 #define CARTO_LOG_ERROR_BREAK_IF_NULL(ptr) CARTO_LOG_ERROR_DO_IF_NULL(ptr, break)
 
 
+// =============================================================================
+// Legacy per-class config USTRUCTs. KEPT: the new FCartographClassDrawTable
+// (Private/Core/CartographClassDrawTable.cpp) and the still-compiling legacy
+// CartographDataStructure.cpp source these by reference as the authoritative
+// per-class draw config (category colors, spline/wire stroke, layer identity).
+// The re-architecture flattens them into FClassDrawInfo at gather; it does NOT
+// re-author the designer-facing config schema, which BlueprintData assets bind to.
+// =============================================================================
 USTRUCT()
 struct FCategoryData
 {
@@ -170,7 +181,20 @@ struct FRuntimeConfig
 
 
 /**
- * 
+ * Re-architected game-instance module (SPEC STAGE2).
+ *
+ * OWNS the slim data spine + render/net subsystems:
+ *   FCartographBuildingStore   - SoA store keyed by FBuildingHandle (no second copy)
+ *   FCartographSpatialGrid     - uniform hash grid keyed by handle (no quadtree+redirector)
+ *   FCartographZBandIndex      - decoupled Z-band filter (the store never sorts)
+ *   FCartographClassDrawTable  - per-class draw table + shared ComputeDrawGeometry
+ *   FCartographTileManager     - monotonic dirty-tile set + per-tile versions
+ *   FCartographCompositor      - never-cancelled convergent tiled FCanvas (TDR fix)
+ *   FCartographMapReplicator   - server-side per-tile snapshot authority (Phase-0 net)
+ *
+ * Build hooks do ONLY O(1) work (store mutate + grid/zband insert/erase + tile
+ * MarkDirtyForBox + server version bump). The legacy O(N) redirector / O(N^2)
+ * gather / cancel-restart coroutine / 256 MB monolith are all deleted.
  */
 UCLASS(PrioritizeCategories=("Draw Data", "Layer Data", "UI", "Advanced", "Default", "Generated Data"))
 class CARTOGRAPH_API UCartographGameInstanceModule : public UGameInstanceModule
@@ -180,6 +204,7 @@ class CARTOGRAPH_API UCartographGameInstanceModule : public UGameInstanceModule
     friend class ACartographModSubsystem;
 	friend class FCartographCanvasRenderItem;
 	friend class UCartographRemoteCallObject;
+	friend class FCartographClassDrawTable;
 
 public:
 	virtual void DispatchLifecycleEvent(ELifecyclePhase Phase) override;
@@ -197,13 +222,49 @@ public:
 	const T* GetDataByBuildableClass(const TMap<TSoftClassPtr<AFGBuildable>, T>& ClassMap, const TMap<TSoftClassPtr<UFGBuildCategory>, T>& CategoryMap, UClass* BuildableClass) const;
 
 private:
-	void RedrawMap(bool bRedrawEntirely);
-	UE5Coro::TCoroutine<> InitialBuildableGather(TArray<TWeakObjectPtr<AFGBuildable>> Factories, TMap<TSubclassOf<AFGBuildable>, TArray<FRuntimeBuildableInstanceData>> Buildings, FForceLatentCoroutine = {});
-	UE5Coro::TCoroutine<> RedrawMapCoroutine(TArray<FBuildingData> AddedBuildings, TArray<FBuildingData> RemovedBuildings, bool bRedrawEntirely, FForceLatentCoroutine = {});
+	// ---- Spine lifecycle (replaces the legacy data path entirely) ----------
 
-	void OnCoroutineFinishedOrCancelled();
+	/** Allocate the spine subsystems + create the persistent atlas + start the
+	 *  never-cancelled compositor. Called from OnWorldLoaded. Idempotent. */
+	void InitializeSpine(UWorld* World);
 
-	void ExecuteRedrawMapCoroutine(bool bRedrawEntirely);
+	/** Release the spine (stop the compositor, clear indices). On world unload. */
+	void ShutdownSpine();
+
+	/** O(N) streaming bucketing gather over the engine subsystems by const-ref
+	 *  (NO by-value engine-map copy, NO O(N^2), NO sort). Replaces the legacy
+	 *  InitialBuildableGather. Interruptible under the init frame budget. */
+	UE5Coro::TCoroutine<> StreamingGather(UE5Coro::FForceLatentCoroutine = {});
+
+	/** Drive the server-side per-tile repack + delta push once per net-tick.
+	 *  No-op on listen host / single-player (no network path). */
+	void ServerNetTick();
+
+	// ---- O(1) build-hook helpers (the hot path) ----------------------------
+
+	/** Translate a buildable class + transform + (optional) typed extra into a
+	 *  slim FBuildingRecord, insert it into the store + grid + Z-band index, mark
+	 *  the touched tiles dirty, and (server) bump their versions. O(1) amortized.
+	 *  Returns the new stable handle (INDEX_NONE handle if not drawable/ignored). */
+	FBuildingHandle AddRecordFromTransform(const TSubclassOf<AFGBuildable>& BuildableClass, const FTransform& Transform, const struct FFGDynamicStruct* TypeSpecificData, AFGBuildable* LiveBuildable);
+
+	/** Erase a handle from the store + grid + Z-band index, mark its tiles dirty,
+	 *  (server) bump versions. O(1). */
+	void RemoveRecord(FBuildingHandle Handle);
+
+	/** Find the live handle that matches a buildable identity key (for removes).
+	 *  Keyed by a generation-guarded {ClassId, world-position} probe via the grid;
+	 *  returns an invalid handle if not found. LiveBuildable (when available) lets
+	 *  splines/wires derive the SAME component position used at insert so the probe
+	 *  matches the stored Pos. */
+	FBuildingHandle FindHandleForRemoval(const TSubclassOf<AFGBuildable>& BuildableClass, const FTransform& Transform, AFGBuildable* LiveBuildable = nullptr) const;
+
+	/** Common store+grid+zband+tile insert for a built FBuildingRecord (+ optional
+	 *  side-table extras already added). Used by both the hooks and the gather. */
+	FBuildingHandle InsertRecord(const FBuildingRecord& Record);
+
+	/** Common store+grid+zband+tile erase for a live handle. */
+	void EraseRecord(FBuildingHandle Handle);
 
 	void RegisterMenuButton() const;
 
@@ -211,9 +272,6 @@ private:
     void SaveRuntimeConfig();
 
 	void FillBuildLayerDataCache();
-
-	void OnBuildingDataAdd(const FBuildingData& AddedBuildingData, int32 Pos);
-    void OnBuildingDataRemove(const FBuildingData& RemovedBuildingData, int32 Pos);
 
 	void GatherBuildables();
 	void GatherModOverrides();
@@ -346,39 +404,44 @@ protected:
 
 
 	TMap<uint32, const FBuildLayerData*> BuildLayerDataMapCache;
+
+	/** Live building count per class hash. KEPT: the UI's DoesBuildingExist reads
+	 *  it (CartographMenuLayerItemWidget). Maintained O(1) in the build hooks. */
 	TMap<uint32, uint32> BuildingCountMap;
+
+	/** ClassId -> class hash reverse lookup so RemoveRecord can decrement
+	 *  BuildingCountMap in O(1) (instead of scanning all classes). Built once in
+	 *  InitializeSpine after ClassDrawTable.Build. Index is the dense ClassId. */
+	TArray<uint32> ClassIdToHash;
 
 
 	bool ShouldInitialize = false;
 	UPROPERTY(BlueprintReadOnly)
 	bool IsInitializing = false;
 
-	UE5Coro::TCoroutine<> Coroutine = UE5Coro::TCoroutine<>::CompletedCoroutine;
-	FDrawToRenderTargetContext RenderContext;
-	FCanvas* CurrentCanvas = nullptr;
-	TArray<FBuildingData> CurrentBuildingData;
+	// ---- The slim spine (replaces CurrentBuildingData + quadtree + redirector) -
+	// Plain C++ members (no UPROPERTY): they hold no UObject refs the GC must
+	// trace except the atlas (a separate rooted UPROPERTY) and the pinned icons
+	// (rooted inside the compositor). The store/grid/zband are pure POD indices.
+	FCartographBuildingStore BuildingStore;
+	FCartographSpatialGrid SpatialGrid;
+	FCartographZBandIndex ZBandIndex;
+	FCartographClassDrawTable ClassDrawTable;
+	FCartographTileManager TileManager;
+	FCartographCompositor Compositor;
+	FCartographMapReplicator MapReplicator;
 
-	/// To get the building data from the quad tree,
-	/// CurrentBuildingData[BuildingDataIndexRedirector[CurrentBuildingQuadTree]]
-    ///	The redirector array doesn't get .Remove()'d, when a building is removed, since we can't update the quad tree's elements.
+	/** The never-cancelled compositor drain loop. Started ONCE in InitializeSpine,
+	 *  completes only on ShutdownSpine (it is never Cancel()'d). */
+	UE5Coro::TCoroutine<> CompositorCoroutine = UE5Coro::TCoroutine<>::CompletedCoroutine;
 
-	TArray<int32> BuildingDataIndexRedirector;
-	TQuadTree<int32> CurrentBuildingQuadTree{ FBox2D{ { WEST_BOUND_CENTIMETERS, NORTH_BOUND_CENTIMETERS }, { EAST_BOUND_CENTIMETERS, SOUTH_BOUND_CENTIMETERS } } };
+	/** The interruptible O(N) initial gather (replaces InitialBuildableGather). */
+	UE5Coro::TCoroutine<> GatherCoroutine = UE5Coro::TCoroutine<>::CompletedCoroutine;
 
-	bool IsPendingRedraw = false;
-	bool IsPendingRedrawEntire = false;
-	TArray<FBuildingData> PendingAddBuildingData;
-	TArray<FBuildingData> PendingRemoveBuildingData;
-
-	bool IsRedrawingEntirely = false;
-	FBox2D RedrawArea;
-	std::array<uint32, 4> ScissorArea;
-
+	bool bSpineInitialized = false;
 	bool IsInWorld = false;
-    bool IsClient = false;
-
-	float MinZFilter = -std::numeric_limits<float>::max();
-    float MaxZFilter = std::numeric_limits<float>::max();
+    bool IsClient = false;          // dedicated client (NM_Client)
+	bool bIsDedicatedServer = false;
 
 	// For blueprint use only
 protected:
@@ -390,8 +453,8 @@ protected:
 	UPROPERTY(BlueprintReadOnly)
 	float MaxHeight = 100;
 
-	float MinCached;
-    float MaxCached;
+	float MinCached = 0.f;
+    float MaxCached = 1.f;
 
     UPROPERTY(BlueprintReadOnly)
     bool DoShowBuildings = true;
@@ -427,6 +490,10 @@ template<typename T>
 concept IsFVector = std::is_same_v<T, FVector> || std::is_same_v<T, FVector2D>;
 
 
+// Legacy world<->screen helpers. KEPT: the still-compiling legacy
+// CartographDataStructure.cpp uses these (FillInCache draw-math path). They now
+// resolve RENDER_TEXTURE_SIZE / ORIGIN_UV / MAP_*_CENTIMETERS from CartographConfig.h
+// (4096), self-consistent with the new atlas. New code uses CartographCoords::*.
 template<IsFVector T, IsFVector U>
 FVector2D world_position_to_screen_position(const T& WorldPosition, const U& Size)
 {

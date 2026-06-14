@@ -2,6 +2,7 @@
 
 #include "CanvasRender.h"
 #include "CartographGameInstanceModule.h"
+#include "Render/CartographCompositor.h"  // per-tile scissor source (post-rearchitecture)
 #include "MeshPassProcessor.h"
 #include "RenderGraphEvent.h"
 
@@ -86,9 +87,21 @@ bool FCartographCanvasRenderItem::Render_GameThread(const FCanvas* Canvas, FCanv
 			Canvas->GetFeatureLevel(),
 			Canvas->GetShaderPlatform()
 		};
+		// POST-rearchitecture the per-tile scissor lives on the COMPOSITOR (it owns
+		// CurrentCanvas + ScissorArea now, not the module). Resolve it on the GAME
+		// THREAD here, before enqueuing the render command, so the render-thread lambda
+		// never dereferences the module/compositor across threads. GetScissorForCanvas
+		// returns true (and fills Area) only when THIS canvas is the compositor's
+		// active tile canvas - exactly the legacy "Canvas == Instance->CurrentCanvas"
+		// gate, plus a zero-area guard. Each tile's scissored batch = a separate
+		// command buffer (the TDR fix, SPEC 4.2).
+		std::array<uint32, 4> ScissorArea = { 0, 0, 0, 0 };
+		const bool IsCartograph = UCartographGameInstanceModule::Instance
+			&& UCartographGameInstanceModule::Instance->Compositor.GetScissorForCanvas(Canvas, ScissorArea);
+
 		RenderScope.AddPass(
 			TEXT("CanvasBatchedElements"),
-			[DrawParameters, IsCartograph = UCartographGameInstanceModule::Instance && Canvas == UCartographGameInstanceModule::Instance->CurrentCanvas](FRHICommandList& RHICmdList)
+			[DrawParameters, IsCartograph, ScissorArea](FRHICommandList& RHICmdList)
 			{
 				/// The ViewRect doesn't seem to affect rendering in any way, so will use scissor.
 				FSceneView SceneView = FBatchedElements::CreateProxySceneView(DrawParameters.RenderData->Transform.GetMatrix(), FIntRect(0, 0, DrawParameters.ViewportSizeX, DrawParameters.ViewportSizeY));
@@ -101,8 +114,7 @@ bool FCartographCanvasRenderItem::Render_GameThread(const FCanvas* Canvas, FCanv
 
 				if (IsCartograph)
 				{
-					const std::array<uint32, 4>& Area = UCartographGameInstanceModule::Instance->ScissorArea;
-					RHICmdList.SetScissorRect(true, Area[0], Area[1], Area[2], Area[3]);
+					RHICmdList.SetScissorRect(true, ScissorArea[0], ScissorArea[1], ScissorArea[2], ScissorArea[3]);
 				}
 				// draw batched items
 				DrawParameters.RenderData->BatchedElements.Draw(

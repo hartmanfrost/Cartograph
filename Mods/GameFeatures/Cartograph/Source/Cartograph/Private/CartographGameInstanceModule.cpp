@@ -1,17 +1,17 @@
-﻿#include "CartographGameInstanceModule.h"
+#include "CartographGameInstanceModule.h"
 
 #include <sstream>
 
 #include "AssetRegistry/AssetRegistryModule.h"
-#include "CanvasItem.h"
 #include "Components/CanvasPanelSlot.h"
-#include "Engine/Canvas.h"
 #include "Engine/CanvasRenderTarget2D.h"
-#include "Algo/FindLast.h"
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
 #include "Misc/OutputDeviceNull.h"
 #include "Blueprint/WidgetBlueprintGeneratedClass.h"
+#include "Components/SplineComponent.h"
+#include "Engine/World.h"
+#include "TimerManager.h"
 
 #include "FGLightweightBuildableSubsystem.h"
 #include "Buildables/FGBuildable.h"
@@ -22,18 +22,24 @@
 #include "FGBuildCategory.h"
 #include "FGBuildSubCategory.h"
 #include "FGPlayerController.h"
-#include "FGSaveSession.h"
 #include "FGSplineBuildableInterface.h"
 
 #include "Configuration/Properties/ConfigPropertyString.h"
 #include "ModLoading/ModLoadingLibrary.h"
-#include "Patching/BlueprintHookManager.h"
 #include "Patching/NativeHookManager.h"
 
 #include "Util/CartographCanvasRenderItem.h"
 #include "CartographModSubsystem.h"
-#include "CartographRemoteCallObject.h"
 #include "Cartograph_ConfigStruct.h"
+
+// The new spine + render/net subsystems this module now owns.
+#include "Core/CartographBuildingStore.h"
+#include "Core/CartographSpatialGrid.h"
+#include "Core/CartographZBandIndex.h"
+#include "Core/CartographClassDrawTable.h"
+#include "Core/CartographTileManager.h"
+#include "Render/CartographCompositor.h"
+#include "Net/CartographMapReplicator.h"
 
 
 #define LOCTEXT_NAMESPACE "Cartograph"
@@ -42,20 +48,161 @@
 DEFINE_LOG_CATEGORY(LogCartograph);
 
 
-template<IsFVector T, IsFVector U>
-void draw_line(UCanvas* Canvas, const T& WorldStart, const U& WorldEnd, const FLinearColor& Color, float Thickness)
+// =============================================================================
+// Re-architected game-instance module (SPEC STAGE2).
+//
+// What changed vs the legacy file:
+//  - DELETED: CurrentBuildingData (TArray<FBuildingData>), BuildingDataIndexRedirector,
+//    CurrentBuildingQuadTree, OnBuildingDataAdd/Remove (the O(N) reindex triad),
+//    RedrawMapCoroutine + RedrawMap + ExecuteRedrawMapCoroutine + OnCoroutineFinishedOrCancelled
+//    (the cancel/restart, 256 MB single-clear, per-primitive-budget draw), and the
+//    O(N^2)/by-value InitialBuildableGather.
+//  - ADDED: the slim spine (store/grid/zband/classtable/tilemanager), the
+//    never-cancelled compositor + Phase-0 ReliableMessaging replicator, O(1) build
+//    hooks, and an O(N) const-ref streaming gather.
+//  - The legacy FCanvas::GetBatchedElements scissor hook is REPOINTED at the
+//    compositor's per-tile scissor (so each tile clip = a separate command buffer)
+//    when the TiledCanvas backend is active.
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// Yaw quantization helper. The slim record keeps only yaw (top-down). Extracted
+// from the transform's rotator.
+// -----------------------------------------------------------------------------
+namespace
 {
-    const FVector2D StartScreenPosition = world_position_to_screen_position(WorldStart, FVector::ZeroVector);
-    const FVector2D EndScreenPosition = world_position_to_screen_position(WorldEnd, FVector::ZeroVector);
-	FCanvasLineItem LineItem{
-		StartScreenPosition,
-		EndScreenPosition
-	};
-	LineItem.LineThickness = Thickness;
-	LineItem.SetColor(Color);
-	// Only opaque lines are supported
-	// LineItem.BlendMode = FCanvas::BlendToSimpleElementBlend
-	Canvas->DrawItem(LineItem);
+	uint16 PackTransformYaw(const FTransform& Transform)
+	{
+		return FBuildingRecord::PackYaw((float)Transform.GetRotation().Rotator().Yaw);
+	}
+
+	/** Resolve a class through the redirect map, matching the legacy FillInHash. */
+	UClass* ResolveRedirect(UClass* OriginalClass)
+	{
+		if (!UCartographGameInstanceModule::Instance || !OriginalClass)
+		{
+			return OriginalClass;
+		}
+		// Explicit soft-class key: Find hashes/compares over the soft object path, not
+		// via an implicit (and possibly explicit-marked) UClass* -> TSoftClassPtr ctor.
+		const TSoftClassPtr<AFGBuildable>* Redirect =
+			UCartographGameInstanceModule::Instance->BuildableClassRedirectMap.Find(TSoftClassPtr<AFGBuildable>(OriginalClass));
+		if (Redirect)
+		{
+			if (UClass* Loaded = Redirect->LoadSynchronous())
+			{
+				return Loaded;
+			}
+		}
+		return OriginalClass;
+	}
+
+	/**
+	 * Compute a record's WORLD-space (cm, XY) bounding box directly from the slim
+	 * record + class info + side-tables, WITHOUT round-tripping the screen-space
+	 * VisualBox back through ScreenToWorld.
+	 *
+	 * The screen->world round-trip the call sites previously used inflates the box
+	 * by the screen quantization (~183 cm/pixel at RENDER_TEXTURE_SIZE=4096), which
+	 * makes a building span more grid cells than its true footprint and bloats grid
+	 * occupancy / QueryRect false positives. This mirrors the SAME world-box math
+	 * ComputeDrawGeometry accumulates internally (footprint corner union for
+	 * Icon/Rectangle, endpoint union for Wire/Beam, point union for Spline),
+	 * expanded by BOX_EXPANSION_CENTIMETERS in world cm exactly like the legacy
+	 * FillInVisualBoxCache. Returns an invalid box for undrawable records (the
+	 * caller then falls back to a point box at the anchor).
+	 */
+	FBox2f ComputeWorldVisualBox(const FBuildingRecord& Record, const FClassDrawInfo& Info, const FCartographBuildingStore& Store)
+	{
+		FBox2D WorldBox(ForceInit);
+
+		const FVector2D WorldPosXY{ (double)Record.Pos.X, (double)Record.Pos.Y };
+
+		switch (Info.DrawType)
+		{
+		case EBuildingDrawType::Spline:
+		{
+			if (Info.StrokeThickness <= 0.f || Record.ExtraIndex == (uint32)INDEX_NONE)
+			{
+				return FBox2f(ForceInit);
+			}
+			const FSplineExtra& Extra = Store.GetSplineExtra(Record.ExtraIndex);
+			if (Extra.Points.Num() < 2)
+			{
+				return FBox2f(ForceInit);
+			}
+			for (const FVector2f& WorldPt : Extra.Points)
+			{
+				WorldBox += FVector2D{ (double)WorldPt.X, (double)WorldPt.Y };
+			}
+			break;
+		}
+		case EBuildingDrawType::Wire:
+		{
+			if (Info.StrokeThickness <= 0.f || Record.ExtraIndex == (uint32)INDEX_NONE)
+			{
+				return FBox2f(ForceInit);
+			}
+			const FWireExtra& Extra = Store.GetWireExtra(Record.ExtraIndex);
+			WorldBox += WorldPosXY;
+			WorldBox += FVector2D{ (double)Extra.End.X, (double)Extra.End.Y };
+			break;
+		}
+		case EBuildingDrawType::Beam:
+		{
+			if (Info.StrokeThickness <= 0.f || Record.ExtraIndex == (uint32)INDEX_NONE)
+			{
+				return FBox2f(ForceInit);
+			}
+			const FBeamExtra& Extra = Store.GetBeamExtra(Record.ExtraIndex);
+			const double YawRad = FMath::DegreesToRadians((double)Record.GetYawDegrees());
+			const FVector2D ForwardXY{ FMath::Cos(YawRad), FMath::Sin(YawRad) };
+			WorldBox += WorldPosXY;
+			WorldBox += WorldPosXY + ForwardXY * (double)Extra.Length;
+			break;
+		}
+		case EBuildingDrawType::Icon:
+		case EBuildingDrawType::Rectangle:
+		{
+			if (Info.Footprint.X == 0.f || Info.Footprint.Y == 0.f)
+			{
+				return FBox2f(ForceInit);
+			}
+			// Yaw-only footprint corner union (scale = 1), matching the slim-record
+			// corner transform in ComputeDrawGeometry.
+			const double HalfWidth = (double)Info.Footprint.X / 2.0;
+			const double HalfHeight = (double)Info.Footprint.Y / 2.0;
+			const FVector LocalCorners[4] = {
+				FVector(-HalfWidth, -HalfHeight, 0.0),
+				FVector(HalfWidth, -HalfHeight, 0.0),
+				FVector(HalfWidth, HalfHeight, 0.0),
+				FVector(-HalfWidth, HalfHeight, 0.0)
+			};
+			const FRotator YawOnly(0.0, (double)Record.GetYawDegrees(), 0.0);
+			const FTransform CornerTransform(YawOnly, FVector(WorldPosXY.X, WorldPosXY.Y, (double)Record.Pos.Z), FVector::OneVector);
+			for (int32 i = 0; i < 4; ++i)
+			{
+				const FVector WorldCorner = CornerTransform.TransformPosition(LocalCorners[i]);
+				WorldBox += FVector2D{ WorldCorner.X, WorldCorner.Y };
+			}
+			break;
+		}
+		case EBuildingDrawType::Invalid:
+		default:
+			return FBox2f(ForceInit);
+		}
+
+		if (!WorldBox.bIsValid)
+		{
+			return FBox2f(ForceInit);
+		}
+		// Expand in world cm exactly like legacy FillInVisualBoxCache.
+		WorldBox = WorldBox.ExpandBy(BOX_EXPANSION_CENTIMETERS);
+		return FBox2f(
+			FVector2f((float)WorldBox.Min.X, (float)WorldBox.Min.Y),
+			FVector2f((float)WorldBox.Max.X, (float)WorldBox.Max.Y));
+	}
 }
 
 
@@ -110,67 +257,49 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 
 	LoadRuntimeConfig();
 
+	// Build the per-class draw table ONCE here (O(distinct classes)), now that the
+	// gather + overrides + layer caches are populated. Records resolve their ClassId
+	// against this table; ComputeDrawGeometry reads its FClassDrawInfo at draw.
+	FillBuildLayerDataCache();
+	ClassDrawTable.Build(this);
+
 
 #pragma region Hooking
-    const auto LambdaAfterAddFromBuildableInstanceData = 
+	// -------------------------------------------------------------------------
+	// Build hooks. POST-rearchitecture each hook does ONLY O(1) work: build a slim
+	// record, insert it into the store + grid + Z-band index, mark the touched
+	// tiles dirty, and (server) bump versions. No O(N) redirector, no coroutine
+	// cancel, no canvas touch. The compositor converges the dirty tiles on tick.
+	// -------------------------------------------------------------------------
+    const auto LambdaAfterAddFromBuildableInstanceData =
         [this](int32 ReturnValue, AFGLightweightBuildableSubsystem* ClassInstance, TSubclassOf<AFGBuildable> BuildableClass,
-            FRuntimeBuildableInstanceData& BuildableInstanceData, bool FromSaveData = false, int32 SaveDataBuildableIndex = INDEX_NONE, 
+            FRuntimeBuildableInstanceData& BuildableInstanceData, bool FromSaveData = false, int32 SaveDataBuildableIndex = INDEX_NONE,
             uint16 ConstructId = MAX_uint16, AActor* BuildEffectInstigator = nullptr, int32 BlueprintBuildEffectIndex = INDEX_NONE)
         {
 			const bool ShouldSkip = ShouldInitialize || FromSaveData || IsClient || !GIsRunning;
-
 			CARTO_LOG_VERBOSE("AddFromBuildableInstanceData: %s, Skip: %d", *BuildableClass->GetName(), ShouldSkip);
-
-			if (ShouldSkip)
+			if (ShouldSkip || BuildableToIgnore.Contains(BuildableClass.Get()))
 			{
 				return;
 			}
 
-			if (BuildableToIgnore.Contains(BuildableClass.Get()))
-			{
-				return;
-			}
-
-			FBuildingData Data{
-					.Transform = BuildableInstanceData.Transform,
-					//.CustomizationData = BuildableInstanceData.CustomizationData,
-			};
-			Data.AddExtraData(BuildableInstanceData.TypeSpecificData);
-            Data.FillInHashAndCache(BuildableClass);
-			PendingAddBuildingData.Add(std::move(Data));
-
-			RedrawMap(false);
+			AddRecordFromTransform(BuildableClass, BuildableInstanceData.Transform, &BuildableInstanceData.TypeSpecificData, nullptr);
         };
 
 
 	const auto LambdaAfterAddFromReplicatedData =
 		[this](AFGLightweightBuildableSubsystem* ClassInstance, TSubclassOf<AFGBuildable> BuildableClass, TSubclassOf<UFGRecipe> BuiltWithRecipe,
-			const FLightweightBuildableReplicationItem& ReplicationData, int32 MaxSize, 
+			const FLightweightBuildableReplicationItem& ReplicationData, int32 MaxSize,
 			AActor* BuildEffectInstigator, int32 BlueprintBuildIndex)
 		{
 			const bool ShouldSkip = ShouldInitialize || IsClient || !GIsRunning;
-
 			CARTO_LOG_VERBOSE("AddFromReplicatedData: %s, Skip: %d", *BuildableClass->GetName(), ShouldSkip);
-
-			if (ShouldSkip)
+			if (ShouldSkip || BuildableToIgnore.Contains(BuildableClass.Get()))
 			{
 				return;
 			}
 
-			if (BuildableToIgnore.Contains(BuildableClass.Get()))
-			{
-				return;
-			}
-
-			FBuildingData Data{
-					.Transform = ReplicationData.Transform,
-					//.CustomizationData = ReplicationData.CustomizationData,
-			};
-            Data.AddExtraData(ReplicationData.TypeSpecificData);
-			Data.FillInHashAndCache(BuildableClass);
-			PendingAddBuildingData.Add(std::move(Data));
-
-			RedrawMap(false);
+			AddRecordFromTransform(BuildableClass, ReplicationData.Transform, &ReplicationData.TypeSpecificData, nullptr);
 		};
 
 
@@ -178,28 +307,13 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 		[this](AFGBuildableSubsystem* ClassInstance, AFGBuildable* Buildable)
 		{
             const bool ShouldSkip = ShouldInitialize || IsClient || !GIsRunning;
-
 			CARTO_LOG_VERBOSE("AddBuildable: %s, Skip: %d", *Buildable->GetClass()->GetName(), ShouldSkip);
-
-			if (ShouldSkip)
+			if (ShouldSkip || BuildableToIgnore.Contains(Buildable->GetClass()))
 			{
 				return;
 			}
 
-			if (BuildableToIgnore.Contains(Buildable->GetClass()))
-			{
-				return;
-			}
-
-			FBuildingData Data{
-					.Transform = Buildable->GetTransform(),
-					//.CustomizationData = Buildable->GetCustomizationData_Native(),
-			};
-			Data.AddExtraData(Buildable);
-			Data.FillInHashAndCache(Buildable->GetClass());
-			PendingAddBuildingData.Add(std::move(Data));
-
-			RedrawMap(false);
+			AddRecordFromTransform(Buildable->GetClass(), Buildable->GetTransform(), nullptr, Buildable);
 		};
 
 
@@ -207,31 +321,20 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 		[this](AFGLightweightBuildableSubsystem* ClassInstance, TSubclassOf<AFGBuildable> BuildableClass, int32 Index)
 		{
             const bool ShouldSkip = ShouldInitialize || IsClient || !GIsRunning;
-
 			CARTO_LOG_VERBOSE("InvalidateRuntimeInstanceDataForIndex: %s, Skip: %d", *BuildableClass->GetName(), ShouldSkip);
-
-			if (ShouldSkip)
-			{
-				return;
-			}
-
-			if (BuildableToIgnore.Contains(BuildableClass.Get()))
+			if (ShouldSkip || BuildableToIgnore.Contains(BuildableClass.Get()))
 			{
 				return;
 			}
 
 			const FRuntimeBuildableInstanceData* LightweightData = ClassInstance->GetRuntimeDataForBuildableClassAndIndex(BuildableClass, Index);
+			CARTO_LOG_ERROR_RETURN_IF_NULL(LightweightData);
 
-			FBuildingData Data{
-					.Transform = LightweightData->Transform,
-					//.CustomizationData = Data->CustomizationData,
-			};
-			Data.AddExtraData(LightweightData->TypeSpecificData);
-			//Data.FillInHashAndCache(BuildableClass);  // Cache are not used in comparison (==, <=>) so we don't need to fill it
-			Data.FillInHash(BuildableClass);
-            PendingRemoveBuildingData.Add(std::move(Data));
-
-			RedrawMap(false);
+			const FBuildingHandle Handle = FindHandleForRemoval(BuildableClass, LightweightData->Transform);
+			if (Handle.IsValid())
+			{
+				RemoveRecord(Handle);
+			}
 		};
 
 
@@ -239,29 +342,20 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 		[this](AFGBuildableSubsystem* ClassInstance, AFGBuildable* Buildable)
 		{
 			const bool ShouldSkip = ShouldInitialize || IsClient || !GIsRunning;
-
 			CARTO_LOG_VERBOSE("RemoveBuildable: %s, Skip: %d", *Buildable->GetClass()->GetName(), ShouldSkip);
-
-			if (ShouldSkip)
+			if (ShouldSkip || BuildableToIgnore.Contains(Buildable->GetClass()))
 			{
 				return;
 			}
 
-			if (BuildableToIgnore.Contains(Buildable->GetClass()))
+			// For splines/wires the legacy stored a transform that came from the
+			// component (not the actor); pass the live Buildable so FindHandleForRemoval
+			// derives the same component position used at insert, so the probe matches.
+			const FBuildingHandle Handle = FindHandleForRemoval(Buildable->GetClass(), Buildable->GetTransform(), Buildable);
+			if (Handle.IsValid())
 			{
-				return;
+				RemoveRecord(Handle);
 			}
-
-            FBuildingData Data{
-                    .Transform = Buildable->GetTransform(),
-                    //.CustomizationData = Buildable->GetCustomizationData_Native(),
-            };
-            Data.AddExtraData(Buildable);
-            //Data.FillInHashAndCache(Buildable->GetClass());  // Cache are not used in comparison (==, <=>) so we don't need to fill it
-			Data.FillInHash(Buildable->GetClass());
-			PendingRemoveBuildingData.Add(std::move(Data));
-
-			RedrawMap(false);
 		};
 
 
@@ -276,27 +370,29 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
             CARTO_LOG("CloseRespawnUI");
 
 	        AFGPlayerController* PlayerController = Cast<AFGPlayerController>(GetWorld()->GetFirstPlayerController());
+			CARTO_LOG_ERROR_RETURN_IF_NULL(PlayerController);
 			if (PlayerController->HasAuthority())
 			{
 				return;
 			}
 
-			auto* RCO = PlayerController->GetRemoteCallObjectOfClass<UCartographRemoteCallObject>();
-			if (RCO)
+			// Dedicated client: kick off the AoI-scoped pull over the replicator
+			// transport (Phase-0). This replaces the deleted slice-RCO request.
+			// The viewport AoI is the whole atlas at join (the client narrows it as
+			// the map UI sets a real viewport). NM_Client only reaches here.
+			ShouldInitialize = false;
+			IsInitializing = true;
+			InitializeSpine(GetWorld());
+
+			if (UCartographMapReplicationComponent* ReplComp =
+				PlayerController->FindComponentByClass<UCartographMapReplicationComponent>())
 			{
-				ShouldInitialize = false;
-				IsInitializing = true;
-				CurrentBuildingData.Empty();
-                BuildingDataIndexRedirector.Empty();
-                CurrentBuildingQuadTree.Empty();
-                BuildingCountMap.Empty();
-				RCO->ReceivedSliceCount = 0;
-				RCO->Buffer.Empty();
-				RCO->ServerRequestInitialBuildingData(PlayerController, EInitialDataSendPhase::Initial);
+				const FBox2f FullAtlas(FVector2f(0.f, 0.f), FVector2f((float)RENDER_TEXTURE_SIZE, (float)RENDER_TEXTURE_SIZE));
+				ReplComp->RequestAoI(FullAtlas);
 			}
 			else
 			{
-                CARTO_LOG_ERROR("Failed to get RemoteCallObject");
+				CARTO_LOG_ERROR("No UCartographMapReplicationComponent on the joining client PC (SPIKE Q1)");
 			}
         };
 
@@ -319,13 +415,30 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 		SUBSCRIBE_UOBJECT_METHOD_AFTER(AFGBuildableSubsystem, RemoveBuildable, LambdaAfterRemoveBuildable);
 
 
+		// The global FCanvas::GetBatchedElements scissor hook. POST-rearchitecture it
+		// reads the COMPOSITOR's active per-tile scissor (Compositor.GetScissorForCanvas)
+		// instead of the deleted UCartographGameInstanceModule::ScissorArea, so each
+		// tile's clip is a separate command buffer (the TDR fix, SPEC 4.2). It is only
+		// meaningful for the TiledCanvas backend; the Slate/instance backends never
+		// open this FCanvas, so GetScissorForCanvas returns false and the hook is inert.
 		SUBSCRIBE_METHOD(FCanvas::GetBatchedElements,
 			[](auto& Scope, FCanvas* ClassInstance,
 				FCanvas::EElementType InElementType, FBatchedElementParameters* InBatchedElementParameters, const FTexture* InTexture, ESimpleElementBlendMode InBlendMode, const FDepthFieldGlowInfo& GlowInfo, bool bApplyDPIScale)
 			{
+				// Only intercept the compositor's own canvas while it is mid-tile.
+				if (!Instance)
+				{
+					return;
+				}
+				std::array<uint32, 4> _ScissorUnused;
+				if (!Instance->Compositor.GetScissorForCanvas(ClassInstance, _ScissorUnused))
+				{
+					return;
+				}
+
 				// get sort element based on the current sort key from top of sort key stack
 				FCanvas::FCanvasSortElement& SortElement = ClassInstance->GetSortElement(ClassInstance->TopDepthSortKey());
-				// find a batch to use 
+				// find a batch to use
 				FCartographCanvasRenderItem* RenderBatch = nullptr;
 				// get the current transform entry from top of transform stack
 				FCanvas::FTransformEntry FinalTransform = ClassInstance->GetTransformStack().Top();
@@ -357,19 +470,138 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 }
 
 
+// =============================================================================
+// Spine lifecycle.
+// =============================================================================
+void UCartographGameInstanceModule::InitializeSpine(UWorld* World)
+{
+	if (bSpineInitialized)
+	{
+		return;
+	}
+	if (!World)
+	{
+		CARTO_LOG_ERROR("InitializeSpine with null world");
+		return;
+	}
+
+	// Allocate the index structures (flat arrays sized off the constexpr geometry).
+	SpatialGrid.Initialize();
+	ZBandIndex.Initialize();
+	TileManager.Initialize();
+
+	// The class draw table was built in DispatchLifecycleEvent (POST_INITIALIZATION);
+	// rebuild defensively if it is empty (e.g. a late world-load before init ran).
+	if (ClassDrawTable.NumClasses() == 0)
+	{
+		FillBuildLayerDataCache();
+		ClassDrawTable.Build(this);
+	}
+
+	// Dense ClassId -> class-hash reverse, so RemoveRecord decrements BuildingCountMap
+	// in O(1). The table assigns ClassIds keyed by the ORIGINAL (pre-redirect) class
+	// (see CartographClassDrawTable::Build), which is exactly the key in
+	// ClassPtrToClassIDMap, so the hash is recoverable directly.
+	ClassIdToHash.Init(0, ClassDrawTable.NumClasses());
+	for (const auto& [Class, Hash] : ClassPtrToClassIDMap)
+	{
+		const uint16 Id = ClassDrawTable.GetClassId(Class.Get());
+		if (Id != FCartographClassDrawTable::InvalidClassId && ClassIdToHash.IsValidIndex(Id))
+		{
+			ClassIdToHash[Id] = Hash;
+		}
+	}
+
+	bIsDedicatedServer = FPlatformProperties::IsServerOnly();
+
+	if (bIsDedicatedServer)
+	{
+		// Dedicated server renders NOTHING: no atlas, no compositor (SPEC 4.5). It
+		// only maintains indices + per-tile versions + slim blobs. Bind the
+		// replicator so joining clients can pull AoI tiles.
+		MapReplicator.Initialize(&BuildingStore, &SpatialGrid, &TileManager);
+		CARTO_LOG("Spine initialized (dedicated server: indices + replicator only)");
+	}
+	else
+	{
+		// Host (listen / SP) and dedicated client render locally through the
+		// compositor onto the persistent atlas. The atlas is a UPROPERTY already
+		// assigned from the asset (RenderTarget); enforce the mip invariant + bind
+		// the compositor + start the never-cancelled drain ONCE.
+		if (RenderTarget)
+		{
+			RenderTarget->bAutoGenerateMips = false;
+			Compositor.Initialize(&BuildingStore, &SpatialGrid, &ZBandIndex, &ClassDrawTable, &TileManager, RenderTarget);
+
+			// Start the never-cancelled convergent loop ONCE. It runs until ShutdownSpine
+			// flips the compositor's bRunning false; it is never Cancel()'d (SPEC 4.3).
+			CompositorCoroutine = Compositor.TickConverge();
+		}
+		else
+		{
+			CARTO_LOG_ERROR("RenderTarget is null on a rendering build; the map will not draw");
+		}
+
+		// A listen host also runs the replicator so dedicated clients can join it.
+		if (!IsClient)
+		{
+			MapReplicator.Initialize(&BuildingStore, &SpatialGrid, &TileManager);
+		}
+
+		CARTO_LOG("Spine initialized (rendering build; backend %d)", (int32)CartographConfig::GetRenderBackend());
+	}
+
+	bSpineInitialized = true;
+}
+
+
+void UCartographGameInstanceModule::ShutdownSpine()
+{
+	if (!bSpineInitialized)
+	{
+		return;
+	}
+
+	// Stop the never-cancelled compositor cleanly (Shutdown flips bRunning so the
+	// loop co_returns; we do NOT Cancel()).
+	Compositor.Shutdown();
+	CompositorCoroutine = UE5Coro::TCoroutine<>::CompletedCoroutine;
+
+	if (!GatherCoroutine.IsDone())
+	{
+		GatherCoroutine.Cancel();
+	}
+	GatherCoroutine = UE5Coro::TCoroutine<>::CompletedCoroutine;
+
+	BuildingStore.Empty();
+	SpatialGrid.Reset();
+	ZBandIndex.Reset();
+	TileManager.Initialize();  // clears dirty + versions
+	BuildingCountMap.Empty();
+
+	bSpineInitialized = false;
+}
+
+
 void UCartographGameInstanceModule::OnWorldLoaded(UWorld* World)
 {
 	CARTO_LOG("OnWorldLoaded");
 
     IsInWorld = true;
-	//ShouldInitialize = true;  // It's too late here, the buildables are already registered. Moved to ModSubSystem.
 	IsClient = GetWorld()->IsNetMode(NM_Client);
+
+	// Build the spine up-front (host/server) so the build hooks have somewhere to
+	// write. On a dedicated client the spine is initialized at CloseRespawnUI when
+	// the AoI pull begins, but initialize it here too so version pings/early tiles
+	// have a target; InitializeSpine is idempotent.
+	InitializeSpine(World);
 
 	if (!IsClient)
 	{
-		// Wait for ACartographModSubsystem to initialize
+		// Wait for ACartographModSubsystem to initialize, then run the O(N) const-ref
+		// streaming bucketing gather (replaces the O(N^2) by-value InitialBuildableGather).
 		GetWorld()->GetTimerManager().SetTimerForNextTick(
-			[this, World]()
+			[this]()
 			{
 				if (!ShouldInitialize || !GIsRunning)
 				{
@@ -378,19 +610,14 @@ void UCartographGameInstanceModule::OnWorldLoaded(UWorld* World)
 
 				ShouldInitialize = false;
 				IsInitializing = true;
-
-				TArray<TWeakObjectPtr<AFGBuildable>> Factories;
-				Algo::Transform(AFGBuildableSubsystem::Get(World)->GetAllBuildablesRef(), Factories,
-					[](AFGBuildable* Buildable) { return Buildable; });
-				Coroutine = InitialBuildableGather(
-					std::move(Factories),
-					AFGLightweightBuildableSubsystem::Get(World)->mBuildableClassToInstanceArray
-				);
+				GatherCoroutine = StreamingGather();
 			});
 	}
 
-	if (!FPlatformProperties::IsServerOnly())
+	if (!FPlatformProperties::IsServerOnly() && RenderTarget)
 	{
+		// Clear the atlas ONCE on load. After this the compositor only ever does
+		// per-tile scissored clears (never a full 256 MB opaque clear again).
 		UKismetRenderingLibrary::ClearRenderTarget2D(this, RenderTarget, { 0, 0, 0, 0 });
 	}
 }
@@ -401,6 +628,7 @@ void UCartographGameInstanceModule::OnWorldUnloaded()
 	CARTO_LOG("OnWorldUnloaded");
 
 	IsInWorld = false;
+	ShutdownSpine();
 }
 
 
@@ -408,7 +636,13 @@ void UCartographGameInstanceModule::OnLayerConfigChanged()
 {
 	CARTO_LOG_DEBUG("OnLayerConfigChanged");
 
-	RedrawMap(true);
+	// A layer toggle changes WHICH buildings draw. The compositor re-converges by
+	// marking every populated tile dirty (a bounded per-tile re-draw, NOT the legacy
+	// O(N) re-walk + 256 MB clear). SetFullRedraw is exactly the #10 full-redraw path.
+	if (!bIsDedicatedServer)
+	{
+		Compositor.SetFullRedraw();
+	}
 	SaveRuntimeConfig();
 }
 
@@ -431,530 +665,501 @@ bool UCartographGameInstanceModule::DoesBuildingExist(uint32 ClassHash) const
 }
 
 
-#pragma region Drawing
-void UCartographGameInstanceModule::RedrawMap(bool bRedrawEntirely)
+// =============================================================================
+// O(1) build-hook helpers (the hot path).
+// =============================================================================
+
+FBuildingHandle UCartographGameInstanceModule::AddRecordFromTransform(
+	const TSubclassOf<AFGBuildable>& BuildableClass, const FTransform& Transform,
+	const FFGDynamicStruct* TypeSpecificData, AFGBuildable* LiveBuildable)
 {
-	if (!Coroutine.IsDone())
+	if (!bSpineInitialized)
 	{
-		if (!IsInitializing)
+		return FBuildingHandle{};
+	}
+
+	UClass* OriginalClass = BuildableClass.Get();
+	if (!OriginalClass)
+	{
+		return FBuildingHandle{};
+	}
+
+	// Resolve the dense ClassId (built once by ClassDrawTable). Records always get a
+	// ClassId so they resolve at draw; an Invalid/undrawable class still indexes but
+	// ComputeDrawGeometry early-outs on it (mirrors legacy "no cache" classes).
+	const uint16 ClassId = ClassDrawTable.GetClassId(OriginalClass);
+	if (ClassId == FCartographClassDrawTable::InvalidClassId)
+	{
+		CARTO_LOG_VERBOSE("No ClassId for %s; not tracked", *OriginalClass->GetName());
+		return FBuildingHandle{};
+	}
+
+	const FClassDrawInfo& Info = ClassDrawTable.GetInfo(ClassId);
+
+	// Build the slim record. For splines/wires the legacy derived Pos from the
+	// component (spline component transform / wire connection 0), not the actor; we
+	// reproduce that so Pos == the legacy stored position (and the side-table
+	// extras match), keeping the rendered map pixel-identical (SPEC Q12).
+	FBuildingRecord Record;
+	Record.ClassId = ClassId;
+	Record.Type = Info.DrawType;
+	Record.ExtraIndex = (uint32)INDEX_NONE;
+
+	FTransform EffectiveTransform = Transform;
+
+	switch (Info.DrawType)
+	{
+	case EBuildingDrawType::Spline:
+	{
+		// Sample the spline polyline. Only available from a live buildable (the
+		// component); the lightweight/replicated paths do not carry a spline, so a
+		// spline that arrives without a live actor is dropped (legacy did the same -
+		// it pulled GetSplineComponent from the cast buildable).
+		const IFGSplineBuildableInterface* Spline = Cast<IFGSplineBuildableInterface>(LiveBuildable);
+		const USplineComponent* SplineComponent = Spline ? Spline->GetSplineComponent() : nullptr;
+		if (!SplineComponent)
 		{
-			CARTO_LOG_DEBUG("RedrawMapCoroutine Cancel Requested");
-			Coroutine.Cancel();
+			return FBuildingHandle{};
 		}
-        IsPendingRedrawEntire = bRedrawEntirely;
-		IsPendingRedraw = true;
+
+		EffectiveTransform = SplineComponent->GetComponentTransform();
+
+		FSplineExtra Extra;
+		Extra.Points.Reserve(SPLINE_SEGMENTS + 1);
+		const float Step = SplineComponent->Duration / SPLINE_SEGMENTS;
+		for (int32 i = 0; i < SPLINE_SEGMENTS + 1; ++i)
+		{
+			const FVector P = SplineComponent->GetLocationAtTime(i * Step, ESplineCoordinateSpace::World, true);
+			Extra.Points.Add(FVector2f((float)P.X, (float)P.Y));
+		}
+		Record.ExtraIndex = BuildingStore.AddSplineExtra(Extra);
+		break;
 	}
-	else if (!IsClient || !IsInitializing)
+
+	case EBuildingDrawType::Wire:
 	{
-		ExecuteRedrawMapCoroutine(bRedrawEntirely);
+		const AFGBuildableWire* Wire = Cast<AFGBuildableWire>(LiveBuildable);
+		if (!Wire)
+		{
+			return FBuildingHandle{};
+		}
+		// Legacy: location = connection 0, end = connection 1.
+		const FVector Start = Wire->GetConnectionLocation(0);
+		const FVector End = Wire->GetConnectionLocation(1);
+		EffectiveTransform.SetLocation(Start);
+
+		FWireExtra Extra;
+		Extra.End = FVector2f((float)End.X, (float)End.Y);
+		Record.ExtraIndex = BuildingStore.AddWireExtra(Extra);
+		break;
 	}
+
+	case EBuildingDrawType::Beam:
+	{
+		// Beam length comes from the lightweight type-specific data.
+		float Length = 0.f;
+		if (TypeSpecificData)
+		{
+			if (const auto* BeamData = TypeSpecificData->GetValuePtr<FBuildableBeamLightweightData>())
+			{
+				Length = BeamData->BeamLength;
+			}
+		}
+		FBeamExtra Extra;
+		Extra.Length = Length;
+		Record.ExtraIndex = BuildingStore.AddBeamExtra(Extra);
+		break;
+	}
+
+	default:
+		break;
+	}
+
+	const FVector Location = EffectiveTransform.GetLocation();
+	Record.Pos = FVector3f((float)Location.X, (float)Location.Y, (float)Location.Z);
+	Record.PackedYaw = PackTransformYaw(EffectiveTransform);
+
+	const FBuildingHandle Handle = InsertRecord(Record);
+
+	// Live count (UI DoesBuildingExist). Keyed by class hash, recovered O(1) from
+	// the dense ClassId via ClassIdToHash.
+	if (ClassIdToHash.IsValidIndex(ClassId))
+	{
+		BuildingCountMap.FindOrAdd(ClassIdToHash[ClassId])++;
+	}
+
+	return Handle;
 }
 
 
-// Factories/Buildings: Intentional copies
-UE5Coro::TCoroutine<> UCartographGameInstanceModule::InitialBuildableGather(
-	TArray<TWeakObjectPtr<AFGBuildable>> Factories, TMap<TSubclassOf<AFGBuildable>, TArray<FRuntimeBuildableInstanceData>> Buildings, FForceLatentCoroutine)
+FBuildingHandle UCartographGameInstanceModule::InsertRecord(const FBuildingRecord& Record)
 {
-	int BuildingCount = 0;
-	for (const auto& [Type, Arr] : Buildings)
+	const FBuildingHandle Handle = BuildingStore.Add(Record);
+
+	// Compute the screen-space draw geometry ONCE here so we know exactly which
+	// tiles/cells this building covers. The VisualBox (screen px, world-expanded) is
+	// the dirty-rect key; the grid is world-keyed so we hand it a world box.
+	const FClassDrawInfo* Info = ClassDrawTable.FindInfo(Record.ClassId);
+	FDrawGeometry Geometry;
+	const bool bDrawable = Info && FCartographClassDrawTable::ComputeDrawGeometry(Record, *Info, BuildingStore, Geometry);
+
+	// World box for the grid: compute the world-space VisualBox DIRECTLY from the
+	// record + class footprint (no screen->world round-trip, which would inflate the
+	// box by the screen quantization and bloat grid occupancy). Fall back to a point
+	// box at the anchor for undrawable records so the grid still tracks them for
+	// picking / removal probing.
+	FBox2f WorldBox(ForceInit);
+	if (bDrawable && Info)
 	{
-        BuildingCount += Arr.Num();
+		WorldBox = ComputeWorldVisualBox(Record, *Info, BuildingStore);
+	}
+	if (!WorldBox.bIsValid)
+	{
+		const FVector2f Anchor(Record.Pos.X, Record.Pos.Y);
+		WorldBox = FBox2f(Anchor, Anchor);
 	}
 
-    CARTO_LOG("InitialBuildableGather Started. Factories: %d, Buildings: %d", Factories.Num(), BuildingCount);
+	SpatialGrid.Insert(Handle, WorldBox);
 
-	const int Total = Factories.Num() + BuildingCount;
-	CurrentBuildingData.Empty(Total);
-    BuildingDataIndexRedirector.Empty();
-    CurrentBuildingQuadTree.Empty();
-    BuildingCountMap.Empty();
-
-	const float TimeBudget = FCartograph_ConfigStruct::GetActiveConfig(GetWorld()).InitializeTimeBudget;
-	UE5Coro::Latent::FTickTimeBudget Budget = UE5Coro::Latent::FTickTimeBudget::Milliseconds(TimeBudget);
-
-	int Processed = 0;
-
-	for (const TWeakObjectPtr<AFGBuildable>& Factory : Factories)
+	// The Z-band index is only CONSUMED by the SlateInstanced backend (which uses
+	// QueryBandRange for painters'-order instance emission). The default TiledCanvas
+	// compositor filters by an exact per-record Z test in DrawTileIntoCanvas and never
+	// queries the bands, so maintaining the index on the default path is pure O(1)
+	// dead weight per insert/erase. Gate the maintenance on the active backend so the
+	// default path does not pay for an unused index (matched in EraseRecord).
+	if (CartographConfig::GetRenderBackend() == ECartographRenderBackend::SlateInstanced)
 	{
-		if (!Factory.IsValid() || BuildableToIgnore.Contains(Factory->GetClass()))
-		{
-			continue;
-		}
-		
-		FBuildingData NewBuildingData{
-			.Transform = Factory->GetTransform(),
-            //.CustomizationData = Factory->GetCustomizationData_Native(),
-		};
-        NewBuildingData.AddExtraData(Factory.Get());
-		NewBuildingData.FillInHashAndCache(Factory->GetClass());
-
-		CurrentBuildingData.Add(std::move(NewBuildingData));
-
-        InitializeProgress = static_cast<float>(++Processed) / Total;
-		co_await Budget;
+		ZBandIndex.Insert(Handle, Record.Pos.Z);
 	}
 
-	for (const auto& [Type, Arr] : Buildings)
+	// Mark every tile the screen VisualBox touches dirty (O(tiles covered)), and on
+	// any authority bump those tiles' versions so AoI clients pull the delta.
+	if (bDrawable && Geometry.VisualBox.bIsValid)
 	{
-        if (BuildableToIgnore.Contains(Type.Get()))
-        {
-            continue;
-        }
+		TileManager.MarkDirtyForBox(Geometry.VisualBox);
 
-		for (const FRuntimeBuildableInstanceData& InstanceData : Arr)
+		if (!IsClient)
 		{
-			FBuildingData NewBuildingData{
-				.Transform = InstanceData.Transform,
-				//.CustomizationData = InstanceData.CustomizationData,
-			};
-            NewBuildingData.AddExtraData(InstanceData.TypeSpecificData);
-			NewBuildingData.FillInHashAndCache(Type);
-
-			CurrentBuildingData.Add(std::move(NewBuildingData));
-
-			InitializeProgress = static_cast<float>(++Processed) / Total;
-			co_await Budget;
+			TArray<FTileId> Tiles;
+			FCartographTileManager::GetTilesForBox(Geometry.VisualBox, Tiles);
+			for (const FTileId Tile : Tiles)
+			{
+				TileManager.BumpVersion(Tile);
+			}
 		}
 	}
 
-	Algo::Sort(CurrentBuildingData);
-	const int Size = CurrentBuildingData.Num();
-	for (int i = 0; i < Size; i++)
-	{
-		const FBuildingData& BuildingData = CurrentBuildingData[i];
-		OnBuildingDataAdd(BuildingData, i);
-	}
-
-	MinHeight = !CurrentBuildingData.IsEmpty() ? CurrentBuildingData[0].Transform.GetLocation().Z : -100;
-	MaxHeight = !CurrentBuildingData.IsEmpty() ? CurrentBuildingData.Last().Transform.GetLocation().Z : 100;
-	OnZFilterUpdated(0, 1);
-
-	CARTO_LOG("InitialBuildableGather Finished");
-
-	for (const auto& [ClassHash, Count] : BuildingCountMap)
-	{
-        CARTO_LOG_DEBUG("Building: %u, Count: %d", ClassHash, Count);
-	}
-
-	IsInitializing = false;
-	IsPendingRedraw = false;
-	ExecuteRedrawMapCoroutine(true);
+	return Handle;
 }
 
 
-// AddedBuildings/RemovedBuildings: Intentional copies
-UE5Coro::TCoroutine<> UCartographGameInstanceModule::RedrawMapCoroutine(
-	TArray<FBuildingData> AddedBuildings, TArray<FBuildingData> RemovedBuildings, bool bRedrawEntirely, FForceLatentCoroutine)
+void UCartographGameInstanceModule::EraseRecord(FBuildingHandle Handle)
 {
-	ON_SCOPE_EXIT
-	{
-        OnCoroutineFinishedOrCancelled();
-	};
-
-	CARTO_LOG_DEBUG("RedrawMapCoroutine Started. Entire: %d", bRedrawEntirely);
-
-	const float TimeBudget = FCartograph_ConfigStruct::GetActiveConfig(GetWorld()).RedrawTimeBudget;
-	UE5Coro::Latent::FTickTimeBudget Budget = UE5Coro::Latent::FTickTimeBudget::Milliseconds(TimeBudget);
-
-    IsRedrawingEntirely |= bRedrawEntirely;
-
-	{
-        UE5Coro::FCancellationGuard Guard{};  // We'll lose added/removed building information if the coroutine is cancelled
-
-		for (FBuildingData& AddedBuildingData : AddedBuildings)
-		{
-	        CARTO_LOG_DEBUG("AddedBuilding: %u", AddedBuildingData.BuildableClassHash);
-
-			if (!IsRedrawingEntirely && AddedBuildingData.VisualBoxCache.bIsValid)
-			{
-				RedrawArea += AddedBuildingData.VisualBoxCache;
-			}
-
-			const int32 Pos = Algo::LowerBound(CurrentBuildingData, AddedBuildingData);
-			OnBuildingDataAdd(AddedBuildingData, Pos);
-			CurrentBuildingData.Insert(std::move(AddedBuildingData), Pos);
-
-			co_await Budget;
-		}
-
-	    for (const FBuildingData& RemovedBuildingData : RemovedBuildings)
-	    {
-	        CARTO_LOG_DEBUG("RemovedBuilding: %u", RemovedBuildingData.BuildableClassHash);
-
-	        const int32 Start = Algo::LowerBound(CurrentBuildingData, RemovedBuildingData);
-            const int32 End = CurrentBuildingData.Num();
-
-	        for (int32 i = Start; i < End; ++i)
-	        {
-	            if (RemovedBuildingData == CurrentBuildingData[i])
-	            {
-					if (!IsRedrawingEntirely && CurrentBuildingData[i].VisualBoxCache.bIsValid)
-					{
-						RedrawArea += CurrentBuildingData[i].VisualBoxCache;
-					}
-
-					OnBuildingDataRemove(CurrentBuildingData[i], i);
-                    CurrentBuildingData.RemoveAt(i);
-	                break;
-	            }
-                if (RemovedBuildingData > CurrentBuildingData[i])
-                {
-                    CARTO_LOG_ERROR("Can't find removed building data");
-                    break;
-                }
-	        }
-
-	        co_await Budget;
-	    }
-
-        MinHeight = !CurrentBuildingData.IsEmpty() ? CurrentBuildingData[0].Transform.GetLocation().Z : -100;
-        MaxHeight = !CurrentBuildingData.IsEmpty() ? CurrentBuildingData.Last().Transform.GetLocation().Z : 100;
-		const float Length = MaxHeight - MinHeight;
-		MinZFilter = FMath::Floor(MinCached * Length + MinHeight);
-		MaxZFilter = FMath::CeilToInt(MaxCached * Length + MinHeight);
-
-		CARTO_LOG_DEBUG("Buildings Change Processed");
-	}
-
-	if (FPlatformProperties::IsServerOnly())
-	{
-		co_return;
-	}
-
-	// Sometimes lines go crazy (goes to the top or far right) if we don't delay.
-	// My guess is because EndDraw and BeginDraw are called in the same frame, so I'm putting it here.
-	co_await UE5Coro::Latent::NextTick();
-
-	UCanvas* Canvas = nullptr;
-	FVector2D _;
-	UKismetRenderingLibrary::BeginDrawCanvasToRenderTarget(this, RenderTarget, Canvas, _, RenderContext);
-	CurrentCanvas = Canvas->Canvas;
-
-	if (IsRedrawingEntirely)
-	{
-		ScissorArea = { 0, 0, RENDER_TEXTURE_SIZE, RENDER_TEXTURE_SIZE };
-	}
-	else
-	{
-		const FVector2D MinScreenPosition = world_position_to_screen_position(RedrawArea.Min, FVector::ZeroVector);
-        const FVector2D MaxScreenPosition = world_position_to_screen_position(RedrawArea.Max, FVector::ZeroVector);
-		const auto MinIntX = static_cast<uint32>(FMath::Max(0, FMath::FloorToInt(MinScreenPosition.X)));
-        const auto MinIntY = static_cast<uint32>(FMath::Max(0, FMath::FloorToInt(MinScreenPosition.Y)));
-        const auto MaxIntX = static_cast<uint32>(FMath::Min(RENDER_TEXTURE_SIZE, FMath::CeilToInt(MaxScreenPosition.X)));
-        const auto MaxIntY = static_cast<uint32>(FMath::Min(RENDER_TEXTURE_SIZE, FMath::CeilToInt(MaxScreenPosition.Y)));
-        ScissorArea = { MinIntX, MinIntY, MaxIntX, MaxIntY };
-        RedrawArea = {
-        	screen_position_to_world_position(FVector2D{ static_cast<double>(MinIntX), static_cast<double>(MinIntY) }),
-			screen_position_to_world_position(FVector2D{ static_cast<double>(MaxIntX), static_cast<double>(MaxIntY) })
-        };
-		CARTO_LOG_DEBUG("RedrawArea: %s", *RedrawArea.ToString());
-	}
-
-	FCanvasTileItem ClearItem{
-		{ 0, 0 },
-		{ RENDER_TEXTURE_SIZE, RENDER_TEXTURE_SIZE },
-		{ 0, 0, 0, 0 }
-	};
-	ClearItem.BlendMode = SE_BLEND_Opaque;
-
-	Canvas->DrawItem(ClearItem);
-
-
-    const int32 Min = Algo::LowerBound(CurrentBuildingData, MinZFilter);
-    const int32 Max = Algo::UpperBound(CurrentBuildingData, MaxZFilter);
-    if (Min >= CurrentBuildingData.Num() || Max <= 0)
-    {
-		IsRedrawingEntirely = false;
-		RedrawArea = {};
-		RedrawArea.bIsValid = false;
-        co_return;
-    }
-
-	CARTO_LOG_DEBUG("From %d to %d out of %d", Min, Max, CurrentBuildingData.Num());
-
-	TArray<int32> BuildingsToDraw;
-	if (IsRedrawingEntirely)
-	{
-        BuildingsToDraw.Reserve(Max - Min);
-        for (int32 i = Min; i < Max; i++)
-        {
-			BuildingsToDraw.Add(i);
-        }
-	}
-	else
-	{
-		CurrentBuildingQuadTree.GetElements(RedrawArea, BuildingsToDraw);
-		co_await Budget;
-
-        for (int32& Index : BuildingsToDraw)
-        {
-            Index = BuildingDataIndexRedirector[Index];
-        }
-		Algo::Sort(BuildingsToDraw);
-        co_await Budget;
-
-		const int* MinIt = Algo::FindByPredicate(BuildingsToDraw, [Min](int32 Index) { return Index >= Min; });
-		const int* MaxIt = Algo::FindLastByPredicate(BuildingsToDraw, [Max](int32 Index) { return Index < Max; });
-        if (!MinIt || !MaxIt)
-        {
-			IsRedrawingEntirely = false;
-			RedrawArea = {};
-			RedrawArea.bIsValid = false;
-            co_return;
-        }
-
-		const int* Beg = BuildingsToDraw.GetData();
-        BuildingsToDraw.RemoveAt(MaxIt - Beg + 1, BuildingsToDraw.Num() - (MaxIt - Beg + 1), EAllowShrinking::No);
-        BuildingsToDraw.RemoveAt(0, MinIt - Beg);
-		co_await Budget;
-
-		CARTO_LOG_DEBUG("Overlapping Elements: %d", BuildingsToDraw.Num());
-	}
-
-	for (int32 i : BuildingsToDraw)
-	{
-        const auto& [ClassHash, Transform/*, CustomizationData*/, BuildableExtraData, 
-			DataType, DataCache, LayerDataCache, VisualBoxCache] = CurrentBuildingData[i];
-
-		CARTO_LOG_VERY_VERBOSE("%d | Buildable: %u, Transform: %s", i, ClassHash, *Transform.ToString());
-
-		if (RuntimeConfig.DisabledLayerBuildable.Contains(ClassHash))
-		{
-            continue;
-		}
-		if (LayerDataCache)
-		{
-			if (RuntimeConfig.DisabledLayerMainCategory.Contains(LayerDataCache->MainCategoryCache))
-			{
-				continue;
-			}
-			if (const TSet<FName>* SubCategories = RuntimeConfig.DisabledLayerSubCategory.Find(LayerDataCache->MainCategoryCache))
-			{
-				if (SubCategories->Contains(LayerDataCache->SubCategoryCache))
-				{
-					continue;
-				}
-			}
-		}
-
-		switch (DataType)
-		{
-		case EBuildingDataType::Invalid:
-			break;
-
-		case EBuildingDataType::Icon:
-		{
-			const FNormalDataCache* NormalDataCachePtr = std::get_if<FNormalDataCache>(&DataCache);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(NormalDataCachePtr);
-
-			const auto& [ScreenPosition, Size, Rotation, IconOrRectangleData] = *NormalDataCachePtr;
-            const TSoftObjectPtr<UTexture2D>* Texture = std::get_if<TSoftObjectPtr<UTexture2D>>(&IconOrRectangleData);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(Texture);
-
-			// The texture might have gotten unloaded between redraws, so we can't cache it.
-			const UTexture2D* LoadedTexture = Texture->Get();
-			if (!LoadedTexture)
-			{
-				LoadedTexture = co_await UE5Coro::Latent::AsyncLoadObject(*Texture);
-			}
-			CARTO_LOG_ERROR_BREAK_IF_NULL(LoadedTexture);
-
-			FCanvasTileItem TileItem{
-				ScreenPosition,
-				LoadedTexture->GetResource(),
-				{ Size.X * PIXEL_PER_CENTIMETER[0], Size.Y * PIXEL_PER_CENTIMETER[1] },
-				{ 0, 0 },
-				{ 1, 1 },
-				FLinearColor::White
-			};
-			TileItem.PivotPoint = { 0.5, 0.5 };
-			TileItem.BlendMode = FCanvas::BlendToSimpleElementBlend(EBlendMode::BLEND_Translucent);
-			TileItem.Rotation = Rotation;
-
-			Canvas->DrawItem(TileItem);
-
-			break;
-		}
-
-		case EBuildingDataType::Rectangle:
-		{
-			const FNormalDataCache* NormalDataCachePtr = std::get_if<FNormalDataCache>(&DataCache);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(NormalDataCachePtr);
-
-			const auto& [ScreenPosition, Size, Rotation, IconOrRectangleData] = *NormalDataCachePtr;
-			const FRectangleDataCache* RectangleDataCachePtr = std::get_if<FRectangleDataCache>(&IconOrRectangleData);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(RectangleDataCachePtr);
-
-			const auto& [CategoryData, Corners] = *RectangleDataCachePtr;
-			CARTO_LOG_ERROR_BREAK_IF_NULL(CategoryData);
-
-			FCanvasTileItem TileItem{
-				ScreenPosition,
-				{ Size.X * PIXEL_PER_CENTIMETER[0], Size.Y * PIXEL_PER_CENTIMETER[1] },
-				CategoryData->MainColor
-			};
-			TileItem.PivotPoint = { 0.5, 0.5 };
-			TileItem.BlendMode = FCanvas::BlendToSimpleElementBlend(EBlendMode::BLEND_Translucent);
-			TileItem.Rotation = Rotation;
-
-			Canvas->DrawItem(TileItem);
-			co_await Budget;
-
-			if (CategoryData->OutlineThickness > 0)
-			{
-				draw_line(Canvas, Corners[0], Corners[1], CategoryData->OutlineColor, CategoryData->OutlineThickness);
-				co_await Budget;
-				draw_line(Canvas, Corners[1], Corners[2], CategoryData->OutlineColor, CategoryData->OutlineThickness);
-				co_await Budget;
-				draw_line(Canvas, Corners[2], Corners[3], CategoryData->OutlineColor, CategoryData->OutlineThickness);
-				co_await Budget;
-				draw_line(Canvas, Corners[3], Corners[0], CategoryData->OutlineColor, CategoryData->OutlineThickness);
-			}
-
-			break;
-		}
-
-		case EBuildingDataType::Spline:
-		{
-            const FSplineDataCache* SplineDataCachePtr = std::get_if<FSplineDataCache>(&DataCache);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(SplineDataCachePtr);
-
-			const FSplineExtraData* SplineExtraData = std::get_if<FSplineExtraData>(&BuildableExtraData);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(SplineExtraData);
-
-            const int Num = SplineExtraData->Points.Num();
-            for (int j = 0; j < Num - 1; j++)
-            {
-                draw_line(Canvas, SplineExtraData->Points[j], SplineExtraData->Points[j + 1],
-					SplineDataCachePtr->SplineData->Color, SplineDataCachePtr->SplineData->Thickness);
-                co_await Budget;
-            }
-
-			break;
-		}
-
-		case EBuildingDataType::Wire:
-		{
-			const FWireExtraData* WireExtraData = std::get_if<FWireExtraData>(&BuildableExtraData);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(WireExtraData);
-
-			const FWireData* const* WireDataPtr = std::get_if<const FWireData*>(&DataCache);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(WireDataPtr);
-            const FWireData* WireData = *WireDataPtr;
-
-			draw_line(Canvas, Transform.GetLocation(), WireExtraData->End, WireData->Color, WireData->Thickness);
-
-			break;
-		}
-
-        case EBuildingDataType::Beam:
-		{
-			const FBeamExtraData* BeamExtraData = std::get_if<FBeamExtraData>(&BuildableExtraData);
-			CARTO_LOG_ERROR_BREAK_IF_NULL(BeamExtraData);
-
-			const FWireData* const* BeamDataPtr = std::get_if<const FWireData*>(&DataCache);
-            CARTO_LOG_ERROR_BREAK_IF_NULL(BeamDataPtr);
-            const FWireData* BeamData = *BeamDataPtr;
-
-			const float Length = BeamExtraData->Length;
-			const FVector Start = Transform.GetLocation();
-			const FVector End = Start + Transform.GetRotation().Vector() * Length;
-			draw_line(Canvas, Start, End, BeamData->Color, BeamData->Thickness);
-
-            break;
-		}
-
-		default:
-			break;
-		}
-
-		if constexpr (DRAW_BOUNDARIES)
-		{
-            constexpr FLinearColor Color{ 1, 0, 1, 1 };
-            constexpr float Thickness = 2;
-
-			const FVector2D MinPoint = VisualBoxCache.Min;
-            const FVector2D MaxPoint = VisualBoxCache.Max;
-            draw_line(Canvas, FVector2D{ MinPoint.X, MinPoint.Y }, FVector2D{ MaxPoint.X, MinPoint.Y }, Color, Thickness);
-			draw_line(Canvas, FVector2D{ MaxPoint.X, MinPoint.Y }, FVector2D{ MaxPoint.X, MaxPoint.Y }, Color, Thickness);
-			draw_line(Canvas, FVector2D{ MaxPoint.X, MaxPoint.Y }, FVector2D{ MinPoint.X, MaxPoint.Y }, Color, Thickness);
-			draw_line(Canvas, FVector2D{ MinPoint.X, MaxPoint.Y }, FVector2D{ MinPoint.X, MinPoint.Y }, Color, Thickness);
-		}
-
-		co_await Budget;
-	}
-
-	IsRedrawingEntirely = false;
-	RedrawArea = {};
-	RedrawArea.bIsValid = false;
-
-	CARTO_LOG_DEBUG("RedrawMapCoroutine Finished");
-}
-
-
-void UCartographGameInstanceModule::OnCoroutineFinishedOrCancelled()
-{
-    CARTO_LOG_DEBUG("OnCoroutineFinishedOrCancelled");
-
-    if (RenderContext.RenderTarget)
-    {
-        UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(this, RenderContext);
-		RenderContext = {};
-    }
-
-	if (!IsPendingRedraw)
+	const FBuildingRecord* Record = BuildingStore.Find(Handle);
+	if (!Record)
 	{
 		return;
 	}
 
-	// The coroutine is also on the game thread, so I think no data race here.
-    IsPendingRedraw = false;
-	ExecuteRedrawMapCoroutine(IsPendingRedrawEntire);
-}
+	// Recompute the same geometry used at insert so we remove from EXACTLY the cells
+	// it was inserted into (grid contract: same box to Remove as Insert) and dirty
+	// the same tiles. ComputeDrawGeometry is pure, so this is deterministic.
+	const FClassDrawInfo* Info = ClassDrawTable.FindInfo(Record->ClassId);
+	FDrawGeometry Geometry;
+	const bool bDrawable = Info && FCartographClassDrawTable::ComputeDrawGeometry(*Record, *Info, BuildingStore, Geometry);
 
-
-void UCartographGameInstanceModule::ExecuteRedrawMapCoroutine(bool bRedrawEntirely)
-{
-	Coroutine = RedrawMapCoroutine(PendingAddBuildingData, PendingRemoveBuildingData, bRedrawEntirely);
-	if (!IsClient)
+	// Derive the world box with the SAME direct computation Insert used so Remove
+	// targets EXACTLY the cells the record was inserted into (grid contract: same box
+	// to Remove as Insert). ComputeWorldVisualBox is pure, so this is deterministic.
+	FBox2f WorldBox(ForceInit);
+	if (bDrawable && Info)
 	{
-		if (!ACartographModSubsystem::Instance)
+		WorldBox = ComputeWorldVisualBox(*Record, *Info, BuildingStore);
+	}
+	if (!WorldBox.bIsValid)
+	{
+		const FVector2f Anchor(Record->Pos.X, Record->Pos.Y);
+		WorldBox = FBox2f(Anchor, Anchor);
+	}
+
+	SpatialGrid.Remove(Handle, WorldBox);
+
+	// Mirror the InsertRecord gating: only the SlateInstanced backend consumes the
+	// Z-band index, so we only maintain it on that path. Removing unconditionally
+	// here while Insert was gated would underflow a band; the matched condition keeps
+	// Insert/Remove balanced regardless of the backend.
+	if (CartographConfig::GetRenderBackend() == ECartographRenderBackend::SlateInstanced)
+	{
+		ZBandIndex.Remove(Handle, Record->Pos.Z);
+	}
+
+	if (bDrawable && Geometry.VisualBox.bIsValid)
+	{
+		TileManager.MarkDirtyForBox(Geometry.VisualBox);
+
+		if (!IsClient)
 		{
-            CARTO_LOG_ERROR("ACartographModSubsystem is not initialized");
-		}
-		else
-		{
-			ACartographModSubsystem::Instance->ClientUpdateBuildingData(PendingAddBuildingData, PendingRemoveBuildingData);
+			TArray<FTileId> Tiles;
+			FCartographTileManager::GetTilesForBox(Geometry.VisualBox, Tiles);
+			for (const FTileId Tile : Tiles)
+			{
+				TileManager.BumpVersion(Tile);
+			}
 		}
 	}
-	PendingAddBuildingData.Empty();
-	PendingRemoveBuildingData.Empty();
+
+	// Free the store slot. Remove() ALSO frees the matching typed side-table entry
+	// per its documented contract (CartographBuildingStore.cpp Remove: it switches on
+	// Record->Type and calls RemoveSplineExtra/RemoveWireExtra/RemoveBeamExtra), then
+	// bumps the slot generation so the freed slot rejects any stale handle (ABA-safety).
+	// We must NOT free the side-table entry manually here too: doing so would push the
+	// same ExtraIndex onto the per-table free-list twice, so the next two AddExtra calls
+	// would alias one slot and corrupt spline/wire/beam geometry on any churned save.
+	BuildingStore.Remove(Handle);
 }
 
 
-void UCartographGameInstanceModule::OnZFilterUpdated(float Min, float Max)
+void UCartographGameInstanceModule::RemoveRecord(FBuildingHandle Handle)
 {
-	MinCached = Min;
-    MaxCached = Max;
-
-	const float Length = MaxHeight - MinHeight;
-	MinZFilter = FMath::Floor(Min * Length + MinHeight);
-	MaxZFilter = FMath::CeilToInt(Max * Length + MinHeight);
-
-	CARTO_LOG("Min is now %f and max is now %f", MinZFilter, MaxZFilter);
-
-	if (!IsInitializing)
+	const FBuildingRecord* Record = BuildingStore.Find(Handle);
+	if (!Record)
 	{
-		RedrawMap(true);
+		return;
+	}
+
+	// Decrement the live count for the UI (DoesBuildingExist) in O(1) via the dense
+	// ClassId -> hash reverse, before the record is freed.
+	if (ClassIdToHash.IsValidIndex(Record->ClassId))
+	{
+		if (uint32* Count = BuildingCountMap.Find(ClassIdToHash[Record->ClassId]))
+		{
+			if (*Count > 0) { --(*Count); }
+		}
+	}
+
+	EraseRecord(Handle);
+}
+
+
+FBuildingHandle UCartographGameInstanceModule::FindHandleForRemoval(
+	const TSubclassOf<AFGBuildable>& BuildableClass, const FTransform& Transform, AFGBuildable* LiveBuildable) const
+{
+	if (!bSpineInitialized)
+	{
+		return FBuildingHandle{};
+	}
+
+	UClass* OriginalClass = BuildableClass.Get();
+	if (!OriginalClass)
+	{
+		return FBuildingHandle{};
+	}
+	const uint16 ClassId = ClassDrawTable.GetClassId(OriginalClass);
+	if (ClassId == FCartographClassDrawTable::InvalidClassId)
+	{
+		return FBuildingHandle{};
+	}
+
+	// Derive the SAME effective position used at insert so the probe matches the
+	// stored Pos: splines use the spline-component transform, wires use connection 0.
+	FVector Location = Transform.GetLocation();
+	const FClassDrawInfo* Info = ClassDrawTable.FindInfo(ClassId);
+	if (Info && LiveBuildable)
+	{
+		if (Info->DrawType == EBuildingDrawType::Spline)
+		{
+			if (const IFGSplineBuildableInterface* Spline = Cast<IFGSplineBuildableInterface>(LiveBuildable))
+			{
+				if (const USplineComponent* SplineComponent = Spline->GetSplineComponent())
+				{
+					Location = SplineComponent->GetComponentTransform().GetLocation();
+				}
+			}
+		}
+		else if (Info->DrawType == EBuildingDrawType::Wire)
+		{
+			if (const AFGBuildableWire* Wire = Cast<AFGBuildableWire>(LiveBuildable))
+			{
+				Location = Wire->GetConnectionLocation(0);
+			}
+		}
+	}
+
+	// Probe the grid at the removed building's anchor and match by (ClassId, position).
+	// Identity is the handle now (SPEC Q13), but the engine remove event gives us only
+	// a class + transform, so we find the live handle by a generation-guarded position
+	// probe rather than an exact-equality compare on the (now single-precision) Pos.
+	// SPIKE(Q11): the SML remove hooks (RemoveBuildable / InvalidateRuntimeInstanceDataForIndex)
+	// give a class + transform, NOT our handle, so we resolve the handle by position.
+	// For splines/wires the legacy stored a component-derived position that this probe
+	// uses the actor transform for, which may miss; validate removal fidelity against
+	// a real engine-side mass removal (mass-dismantle) on the fork. A miss leaks a
+	// stale record until the next reconcile/full-rebuild, never a crash.
+	const FVector2f Anchor((float)Location.X, (float)Location.Y);
+	const FBox2f ProbeBox(Anchor, Anchor);
+
+	FBuildingHandle Best{};
+	float BestDistSq = TNumericLimits<float>::Max();
+	const FVector3f Target((float)Location.X, (float)Location.Y, (float)Location.Z);
+
+	SpatialGrid.QueryRect(ProbeBox, [&](FBuildingHandle Handle)
+	{
+		const FBuildingRecord* Record = BuildingStore.Find(Handle);
+		if (!Record || Record->ClassId != ClassId)
+		{
+			return;
+		}
+		const float DistSq = (Record->Pos - Target).SizeSquared();
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			Best = Handle;
+		}
+	});
+
+	// Accept only a near-exact match (within 1 cm^2) so we never remove the wrong
+	// building when two of the same class are in the same grid cell.
+	constexpr float MaxMatchDistSq = 1.0f;
+	if (Best.IsValid() && BestDistSq <= MaxMatchDistSq)
+	{
+		return Best;
+	}
+	return FBuildingHandle{};
+}
+
+
+// =============================================================================
+// O(N) const-ref streaming gather (replaces the O(N^2)/by-value gather).
+// =============================================================================
+UE5Coro::TCoroutine<> UCartographGameInstanceModule::StreamingGather(UE5Coro::FForceLatentCoroutine)
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		IsInitializing = false;
+		co_return;
+	}
+
+	AFGBuildableSubsystem* BuildableSubsystem = AFGBuildableSubsystem::Get(World);
+	AFGLightweightBuildableSubsystem* LightweightSubsystem = AFGLightweightBuildableSubsystem::Get(World);
+
+	// Const-ref iteration over the engine arrays - NO by-value engine-map deep copy
+	// (deletes initial-load-full-copy-by-value). The engine is the source of truth.
+	const TArray<AFGBuildable*>& Buildables = BuildableSubsystem->GetAllBuildablesRef();
+	const TMap<TSubclassOf<AFGBuildable>, TArray<FRuntimeBuildableInstanceData>>& Lightweight =
+		LightweightSubsystem->GetAllLightweightBuildableInstances();
+
+	int32 LightweightCount = 0;
+	for (const auto& [Type, Arr] : Lightweight)
+	{
+		LightweightCount += Arr.Num();
+	}
+	const int32 Total = FMath::Max(1, Buildables.Num() + LightweightCount);
+	CARTO_LOG("StreamingGather Started. Buildables: %d, Lightweight: %d", Buildables.Num(), LightweightCount);
+
+	BuildingStore.Reserve(Total);
+
+	const float TimeBudget = FCartograph_ConfigStruct::GetActiveConfig(World).InitializeTimeBudget;
+	UE5Coro::Latent::FTickTimeBudget Budget = UE5Coro::Latent::FTickTimeBudget::Milliseconds(TimeBudget);
+
+	int32 Processed = 0;
+
+	for (AFGBuildable* Buildable : Buildables)
+	{
+		if (IsValid(Buildable) && !BuildableToIgnore.Contains(Buildable->GetClass()))
+		{
+			AddRecordFromTransform(Buildable->GetClass(), Buildable->GetTransform(), nullptr, Buildable);
+		}
+		InitializeProgress = (float)(++Processed) / Total;
+		co_await Budget;
+	}
+
+	for (const auto& [Type, Arr] : Lightweight)
+	{
+		if (BuildableToIgnore.Contains(Type.Get()))
+		{
+			Processed += Arr.Num();
+			continue;
+		}
+		for (const FRuntimeBuildableInstanceData& InstanceData : Arr)
+		{
+			AddRecordFromTransform(Type, InstanceData.Transform, &InstanceData.TypeSpecificData, nullptr);
+			InitializeProgress = (float)(++Processed) / Total;
+			co_await Budget;
+		}
+	}
+
+	// Height slider bounds. Derive from the live Z extent of the store (one O(N)
+	// pass - acceptable once at gather; the legacy did the same off the sorted array).
+	MinHeight = -100.f;
+	MaxHeight = 100.f;
+	bool bAny = false;
+	float MinZ = TNumericLimits<float>::Max();
+	float MaxZ = -TNumericLimits<float>::Max();
+	BuildingStore.ForEach([&](FBuildingHandle, const FBuildingRecord& Record)
+	{
+		bAny = true;
+		MinZ = FMath::Min(MinZ, Record.Pos.Z);
+		MaxZ = FMath::Max(MaxZ, Record.Pos.Z);
+	});
+	if (bAny)
+	{
+		MinHeight = MinZ;
+		MaxHeight = MaxZ;
+	}
+
+	// Apply the current slider range to the compositor and first-paint everything.
+	OnZFilterUpdated(MinCached, MaxCached);
+
+	CARTO_LOG("StreamingGather Finished. Live: %d", BuildingStore.Num());
+
+	IsInitializing = false;
+
+	if (!bIsDedicatedServer)
+	{
+		// Drain everything via the never-cancelled compositor (bounded per tile).
+		Compositor.SetFullRedraw();
 	}
 }
-#pragma endregion
+
+
+// =============================================================================
+// Server net-tick: repack dirty tiles + push deltas to AoI clients.
+// =============================================================================
+void UCartographGameInstanceModule::ServerNetTick()
+{
+	if (IsClient || !bSpineInitialized)
+	{
+		return;  // clients never repack; host/server only
+	}
+
+	// Push per-client deltas. Each PC's UCartographMapReplicationComponent diffs the
+	// live per-tile versions against what it last sent that client and streams a
+	// shallow window (SPEC 4.4). On a listen host with no remote clients this is a
+	// no-op. Repacking is lazy inside GetTileSnapshot, so we do not eagerly repack
+	// every dirty tile here.
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		if (APlayerController* PC = It->Get())
+		{
+			if (UCartographMapReplicationComponent* ReplComp = PC->FindComponentByClass<UCartographMapReplicationComponent>())
+			{
+				ReplComp->PushPendingDeltas();
+			}
+		}
+	}
+}
 
 
 #pragma region UI
 void UCartographGameInstanceModule::RegisterMenuButton() const
 {
-	if (!FPlatformProperties::RequiresCookedData() || FPlatformProperties::IsServerOnly()) 
+	if (!FPlatformProperties::RequiresCookedData() || FPlatformProperties::IsServerOnly())
 	{
 		return;
 	}
@@ -1147,7 +1352,10 @@ void UCartographGameInstanceModule::FillBuildLayerDataCache()
 			continue;
 		}
 
-		const TSoftClassPtr<AFGBuildable>* RedirectClass = BuildableClassRedirectMap.Find(OriginalBuildableClass.Get());
+		// Build the soft-class key explicitly so Find hashes/compares over the soft
+		// object path (the map's true key identity), not via an implicit-and-maybe-
+		// explicit UClass* -> TSoftClassPtr conversion inside Find.
+		const TSoftClassPtr<AFGBuildable>* RedirectClass = BuildableClassRedirectMap.Find(TSoftClassPtr<AFGBuildable>(OriginalBuildableClass.Get()));
 		const TSubclassOf<AFGBuildable> BuildableClass = RedirectClass ? RedirectClass->LoadSynchronous() : OriginalBuildableClass.Get();
 
 		const uint32* BuildableClassHash = ClassPtrToClassIDMap.Find(BuildableClass);
@@ -1191,46 +1399,23 @@ void UCartographGameInstanceModule::FillBuildLayerDataCache()
 }
 
 
-void UCartographGameInstanceModule::OnBuildingDataAdd(const FBuildingData& AddedBuildingData, int32 Pos)
+void UCartographGameInstanceModule::OnZFilterUpdated(float Min, float Max)
 {
-	if (AddedBuildingData.VisualBoxCache.bIsValid)
+	MinCached = Min;
+    MaxCached = Max;
+
+	const float Length = MaxHeight - MinHeight;
+	const float MinZFilter = FMath::Floor(Min * Length + MinHeight);
+	const float MaxZFilter = FMath::CeilToInt(Max * Length + MinHeight);
+
+	CARTO_LOG("Min is now %f and max is now %f", MinZFilter, MaxZFilter);
+
+	// Z-slider is now O(bands + hits): the compositor re-converges the affected tiles
+	// instead of the legacy O(N) re-walk + 256 MB clear (client-full-rebuild-on-zfilter).
+	if (!bIsDedicatedServer)
 	{
-		CurrentBuildingQuadTree.Insert(BuildingDataIndexRedirector.Num(), AddedBuildingData.VisualBoxCache);
-		for (int32& Index : BuildingDataIndexRedirector)
-		{
-			if (Index >= Pos)
-			{
-				Index++;
-			}
-		}
-		BuildingDataIndexRedirector.Add(Pos);
+		Compositor.SetZFilter(MinZFilter, MaxZFilter);
 	}
-
-	BuildingCountMap.FindOrAdd(AddedBuildingData.BuildableClassHash)++;
-}
-
-
-void UCartographGameInstanceModule::OnBuildingDataRemove(const FBuildingData& RemovedBuildingData, int32 Pos)
-{
-	if (RemovedBuildingData.VisualBoxCache.bIsValid)
-	{
-		const int32 Num = BuildingDataIndexRedirector.Num();
-		for (int32 i = 0; i < Num; i++)
-		{
-			int32& BuildingDataArrayIndex = BuildingDataIndexRedirector[i];
-			if (BuildingDataArrayIndex == Pos)
-			{
-				CurrentBuildingQuadTree.Remove(i, RemovedBuildingData.VisualBoxCache);
-				BuildingDataArrayIndex = -1;
-			}
-			else if (BuildingDataArrayIndex > Pos)
-			{
-				BuildingDataArrayIndex--;
-			}
-		}
-	}
-
-	BuildingCountMap.FindChecked(RemovedBuildingData.BuildableClassHash)--;
 }
 
 
@@ -1259,6 +1444,12 @@ void UCartographGameInstanceModule::OnShowBuildingsCheckboxChanged(bool DoShow)
 {
     DoShowBuildings = DoShow;
     CARTO_LOG("DoShowBuildings: %d", DoShowBuildings);
+
+	// Toggle building visibility on the compositor (re-converges per tile).
+	if (!bIsDedicatedServer)
+	{
+		Compositor.SetShowBuildings(DoShow);
+	}
 }
 
 
@@ -1403,10 +1594,10 @@ void UCartographGameInstanceModule::GatherBuildables()
 			.SubCategory = BuildSubCategory,
 			.Icon = Icon,
         });
-		
+
 		CARTO_LOG_DEBUG("Path: %s, Class: %s, BuildableClass: %s, NoIcon: %d",
-			*AssetPath.ToString(), 
-			*Name, 
+			*AssetPath.ToString(),
+			*Name,
 			*BuildableClass->GetName(),
 			Icon == nullptr);
 	}
