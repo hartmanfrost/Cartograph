@@ -43,7 +43,8 @@ class UFGBuildingDescriptor;
 struct FRuntimeBuildableInstanceData;
 
 
-DECLARE_LOG_CATEGORY_EXTERN(LogCartograph, Display, All);
+// LogCartograph is declared in CartographConfig.h (included above) so it is
+// declared exactly once across all TUs; defined in CartographGameInstanceModule.cpp.
 
 
 constexpr bool ENABLE_DEBUG_LOG = false;

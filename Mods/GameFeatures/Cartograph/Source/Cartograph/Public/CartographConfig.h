@@ -3,6 +3,12 @@
 #include "CoreMinimal.h"
 #include "HAL/IConsoleManager.h"
 
+// The mod-wide log category. Declared in this shared config header (which every
+// subsystem includes — directly, or via CartographGameInstanceModule.h) so it is
+// declared exactly once across all translation units, avoiding a redefinition in
+// unity builds. The object is defined in CartographGameInstanceModule.cpp.
+DECLARE_LOG_CATEGORY_EXTERN(LogCartograph, Display, All);
+
 // =============================================================================
 // CartographConfig.h - FROZEN CONTRACT (Agent: contracts)
 // -----------------------------------------------------------------------------

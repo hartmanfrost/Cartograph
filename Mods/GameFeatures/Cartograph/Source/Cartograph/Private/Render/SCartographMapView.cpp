@@ -12,14 +12,9 @@
 #include "Styling/SlateBrush.h"
 #include "Framework/Application/SlateApplication.h"  // FSlateApplication::Get().GetRenderer()->GetResourceHandle
 
-// Logging: link to the existing LogCartograph category (object defined in
-// CartographGameInstanceModule.cpp). We deliberately do NOT include the legacy
-// CartographGameInstanceModule.h here: it redefines RENDER_TEXTURE_SIZE
-// (8192) / ORIGIN_UV / PIXEL_PER_CENTIMETER / SPLINE_SEGMENTS, which collide
-// with the re-architected CartographConfig.h values (RENDER_TEXTURE_SIZE 4096).
-// Re-declare only the category extern + the one log macro this file needs, in
-// the repo's CARTO_LOG style.
-DECLARE_LOG_CATEGORY_EXTERN(LogCartograph, Display, All);
+// Logging: LogCartograph is declared in CartographConfig.h (included above);
+// only the one log macro this file needs is defined below, in the repo's
+// CARTO_LOG style. We intentionally avoid the heavy CartographGameInstanceModule.h.
 
 #ifndef CARTO_LOG_VERY_VERBOSE
 #define CARTO_LOG_VERY_VERBOSE(format, ...) if constexpr (false) UE_LOG(LogCartograph, Display, TEXT(format) __VA_OPT__(, __VA_ARGS__))
