@@ -1,0 +1,334 @@
+name: Build Cartograph
+
+# ---------------------------------------------------------------------------
+# Builds and packages the Cartograph GameFeature mod for Satisfactory.
+#
+# HARD REALITY (read CI-SETUP.md): this mod targets Coffee Stain's PRIVATE
+# Unreal Engine fork (FactoryGame.uproject -> EngineAssociation "5.6.1-CSS").
+# That engine is NOT installable on github-hosted runners and is access-gated
+# behind an Epic<->GitHub link + membership in satisfactorymodding/UnrealEngine.
+# Therefore the real build job runs on a SELF-HOSTED runner that already has
+# (or can fetch) the CSS engine + Wine/MSVC cross-toolchain + Wwise SDK.
+#
+# This workflow is a faithful adaptation of the ONLY authoritative blueprint,
+# SatisfactoryModLoader/.github/workflows/build.yml, with -dlcname=SML swapped
+# for -dlcname=Cartograph and paths pointed at this repo's layout.
+#   ref: https://raw.githubusercontent.com/satisfactorymodding/SatisfactoryModLoader/master/.github/workflows/build.yml
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [ "Cartograph", "cartograph-rearch" ]   # default branch + the re-architecture branch
+    paths-ignore:
+      - "**/*.md"                          # docs-only edits do not need a 40+ min UE build
+      - ".gitignore"
+  pull_request:                            # validate that PRs still compile/package
+  workflow_dispatch:                       # manual "build a release" button
+
+# Cancel an in-flight build when a newer commit lands on the same branch/PR.
+# github.ref already disambiguates branches (refs/heads/*) and PRs (refs/pull/N/merge),
+# so this never cross-cancels unrelated refs.
+#   ref: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Protect the default/release branch from being cancelled; still cancel feature/PR builds.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/Cartograph' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # =========================================================================
+  # GATE: external/fork PRs cannot read repository secrets (BOT_TOKEN / Wwise),
+  # so they physically cannot fetch the private engine. Fail them early with a
+  # friendly message instead of letting the real build die deep in toolchain
+  # setup. This mirrors SML's own fork-PR gate.
+  # =========================================================================
+  permission-check:
+    runs-on: ubuntu-latest               # cheap hosted runner: only checks a secret is visible
+    outputs:
+      has-secrets: ${{ steps.check.outputs.has-secrets }}
+    steps:
+      - id: check
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "::error::This build needs the private CSS engine, which requires repository secrets (BOT_TOKEN, WWISE_EMAIL, WWISE_PASSWORD)."
+            echo "::error::Fork/external PRs cannot access these secrets and therefore cannot be built in CI. A maintainer must build from a trusted branch."
+            echo "has-secrets=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "has-secrets=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: permission-check
+    if: needs.permission-check.outputs.has-secrets == 'true'
+
+    # -----------------------------------------------------------------------
+    # SELF-HOSTED runner. Label your runner with exactly these labels:
+    #   satisfactory : has the CSS engine + Wine/MSVC toolchain + Wwise SDK
+    #   linux        : this job cross-compiles Win64 from Linux (like SML CI)
+    # A persistent $RUNNER_TOOL_CACHE / work volume is what makes warm builds
+    # fast (engine, Wine, MSVC and Wwise are NOT re-fetched each run). See
+    # CI-SETUP.md for runner registration and prerequisites.
+    #
+    # NOTE: SML upstream uses runs-on: arc-k8s (Actions Runner Controller on
+    # k8s). Any persistent self-hosted Linux host works; just match the labels.
+    # -----------------------------------------------------------------------
+    runs-on: [ self-hosted, satisfactory, linux ]
+
+    timeout-minutes: 240                  # cold builds (Wine-from-source + engine download) are long
+
+    env:
+      # All heavy, reusable state lives OUTSIDE $GITHUB_WORKSPACE on the runner's
+      # persistent disk to (a) survive between jobs and (b) dodge MSVC/Windows
+      # path-length limits during packaging (SML copies work to /tmp/work for
+      # exactly this reason). Override these on the runner if your mount differs.
+      WORK_DIR: /tmp/work
+      UE_DIR: /tmp/work/ue                # extracted CSS engine (read-only, immutable)
+      PROJECT_DIR: /tmp/work/Cartograph   # the project copied out of the workspace
+      UPROJECT: /tmp/work/Cartograph/FactoryGame.uproject
+      MOD_REFERENCE: Cartograph           # == the .uplugin name and -dlcname value
+      # Persistent caches live on the runner volume (NOT actions/cache — the engine,
+      # Wine/MSVC toolchain and DDC are tens of GB and survive across jobs on the
+      # self-hosted host; $RUNNER_TOOL_CACHE is provided by the runner itself).
+      UE_LocalDataCachePath: /tmp/work/ddc/cartograph   # local Zen DDC: warm shader/asset cooks
+      # ---- Pinned, version-coupled inputs. These MUST match the 5.6.1-CSS engine. ----
+      # Wwise: the SDK download version and the UE integration version are
+      # INTENTIONALLY different (Wwise's API uses the first 3 version parts plus a
+      # separate 5th "integration" suffix). This pairing is the classic
+      # "Wwise version mismatch" CI failure — bump both in lockstep with the engine.
+      WWISE_SDK_VERSION: "2023.1.14.8770"
+      WWISE_INTEGRATION_VERSION: "2023.1.14.3555"
+
+    steps:
+      # ---------------------------------------------------------------------
+      - name: Checkout Cartograph
+        uses: actions/checkout@v4
+        with:
+          lfs: true                       # content plugins may store assets via Git LFS
+          submodules: recursive           # SML/Alpakit/Wwise may be wired as submodules in some setups
+
+      # ---------------------------------------------------------------------
+      # Stage the project onto the persistent work volume, OUTSIDE the workspace.
+      # MSVC under Wine hits Windows MAX_PATH limits when building deep plugin
+      # paths inside the default runner workdir; /tmp/work keeps paths short.
+      # rsync is incremental, so warm runs only copy changed files.
+      # ---------------------------------------------------------------------
+      - name: Stage project to short work path
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR" "$UE_LocalDataCachePath"
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude 'Saved/' \
+            "${GITHUB_WORKSPACE}/" "$PROJECT_DIR/"
+
+      # ---------------------------------------------------------------------
+      # ENGINE: fetch the prebuilt Linux editor from the PRIVATE repo, but only
+      # if it is not already present/cached on the runner volume. The asset is a
+      # multi-part, zstd-compressed tar split across release assets (hence the
+      # wildcard .* and `cat` concatenation). GH_TOKEN must belong to an account
+      # with read access to satisfactorymodding/UnrealEngine.
+      #   ref: SML build.yml "Download, Extract and Setup UE"
+      # ---------------------------------------------------------------------
+      - name: Download, Extract and Setup CSS Engine (cached)
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -f "$UE_DIR/.installed" ]; then
+            echo "CSS engine already present at $UE_DIR — skipping download."
+          else
+            mkdir -p "$UE_DIR"
+            cd "$WORK_DIR"
+            # Downloads UnrealEngine-CSS-Editor-Linux.tar.zst.000, .001, ... from the
+            # latest 5.6.1-CSS release. Pin to a specific tag with --tag if you need
+            # reproducibility across engine bumps.
+            gh release download --repo satisfactorymodding/UnrealEngine \
+              -p "UnrealEngine-CSS-Editor-Linux.tar.zst.*"
+            cat UnrealEngine-CSS-Editor-Linux.tar.zst.* | zstd -d | tar -xf - -C "$UE_DIR"
+            rm -f UnrealEngine-CSS-Editor-Linux.tar.zst.*
+            "$UE_DIR/Engine/Binaries/Linux/UnrealVersionSelector" -register || true
+            touch "$UE_DIR/.installed"
+          fi
+
+      # ---------------------------------------------------------------------
+      # WWISE: integrate the EXACT Wwise SDK the CSS engine expects. wwise-cli is
+      # public (mircearoata/wwise-cli) but downloading the SDK needs an
+      # Audiokinetic account (WWISE_EMAIL/WWISE_PASSWORD). Skipped if already
+      # integrated on this project copy. The local Mods/WwisePatches plugin's
+      # PreBuildSteps (applyPatches.sh) then patches the SDK to compile against
+      # the CSS engine — that runs automatically inside UBT, no extra step needed.
+      #   ref: SML build.yml "Download Wwise"
+      # ---------------------------------------------------------------------
+      - name: Integrate Wwise SDK (cached)
+        env:
+          GH_TOKEN: ${{ secrets.BOT_TOKEN }}
+          WWISE_EMAIL: ${{ secrets.WWISE_EMAIL }}
+          WWISE_PASSWORD: ${{ secrets.WWISE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -d "$PROJECT_DIR/Plugins/Wwise" ] || [ -d "$PROJECT_DIR/Mods/WwisePatches/ThirdParty/.integrated" ]; then
+            echo "Wwise already integrated — skipping."
+          else
+            cd "$WORK_DIR"
+            gh release download --repo mircearoata/wwise-cli -p "wwise-cli-linux" || \
+              gh release download --repo mircearoata/wwise-cli -p "wwise-cli*"
+            chmod +x ./wwise-cli* && mv ./wwise-cli* ./wwise-cli
+            ./wwise-cli download \
+              --sdk-version "$WWISE_SDK_VERSION" \
+              --filter Packages=SDK \
+              --filter DeploymentPlatforms=Windows_vc160 \
+              --filter DeploymentPlatforms=Windows_vc170 \
+              --filter DeploymentPlatforms=Linux
+            ./wwise-cli integrate-ue \
+              --integration-version "$WWISE_INTEGRATION_VERSION" \
+              --project "$UPROJECT"
+          fi
+
+      # ---------------------------------------------------------------------
+      # TOOLCHAIN SANITY: Wine 11.0 (typelib-patched) + MSVC 17.8 via msvc-wine
+      # (Win SDK 10.0.22621) are expected to be PRE-BAKED on this self-hosted
+      # runner / image (they take ~30 min to build from source and are cached in
+      # $RUNNER_TOOL_CACHE). We only verify they exist; provisioning them is a
+      # runner-setup concern documented in CI-SETUP.md, not a per-build step.
+      # ---------------------------------------------------------------------
+      - name: Verify cross-toolchain present
+        run: |
+          set -euo pipefail
+          command -v wine64 >/dev/null 2>&1 || command -v wine >/dev/null 2>&1 || {
+            echo "::error::Wine not found on runner. The self-hosted runner must be provisioned with Wine 11.0 + msvc-wine (MSVC 17.8). See CI-SETUP.md."; exit 1; }
+          test -d "$UE_DIR/Engine" || { echo "::error::Engine not found at $UE_DIR"; exit 1; }
+
+      # ---------------------------------------------------------------------
+      # OPTIONAL build-tuning. UE compile is CPU-bound; let UBT saturate all
+      # cores. For a single small GameFeature module the defaults (unity build +
+      # PCH ON) are already near-optimal, so we only force max parallelism.
+      #   ref: https://dev.epicgames.com/documentation/en-us/unreal-engine/build-configuration-for-unreal-engine
+      # ---------------------------------------------------------------------
+      - name: Tune UnrealBuildTool (max parallelism)
+        run: |
+          set -euo pipefail
+          CFG="$PROJECT_DIR/Saved/UnrealBuildTool"
+          mkdir -p "$CFG"
+          cat > "$CFG/BuildConfiguration.xml" <<'XML'
+          <?xml version="1.0" encoding="utf-8" ?>
+          <Configuration xmlns="https://www.unrealengine.com/BuildConfiguration">
+            <BuildConfiguration>
+              <!-- 0 = use all available logical cores -->
+              <MaxParallelActions>0</MaxParallelActions>
+              <bUseUnityBuild>true</bUseUnityBuild>
+              <bUsePCHFiles>true</bUsePCHFiles>
+            </BuildConfiguration>
+          </Configuration>
+          XML
+
+      # ---------------------------------------------------------------------
+      # Build the editor in Development so cooking has the editor modules.
+      # The engine is prebuilt/installed and is NOT recompiled here.
+      #   ref: SML build.yml "Build for Development Editor"
+      # ---------------------------------------------------------------------
+      - name: Build FactoryEditor (Development)
+        run: |
+          set -euo pipefail
+          "$UE_DIR/Engine/Build/BatchFiles/Linux/Build.sh" \
+            FactoryEditor Linux Development \
+            -project="$UPROJECT" \
+            2>&1 | tee "$WORK_DIR/build-editor.log"
+
+      # ---------------------------------------------------------------------
+      # PACKAGE the mod. This is Alpakit's UAT command (PackagePlugin), the same
+      # thing the in-editor Alpakit button wraps. Builds Win64 client (Shipping),
+      # Win64+Linux dedicated server (Shipping), cooks content, paks, stages, and
+      # writes per-target + merged zips to Saved/ArchivedPlugins/<dlcname>/.
+      #   -dlcname=Cartograph : THE mod reference (== Cartograph.uplugin name)
+      #   -build              : compile the plugin's C++
+      #   -nocompileeditor    : do NOT rebuild the editor (done above)
+      #   -installed          : treat the engine as read-only prebuilt (no engine recompile)
+      #   -merge              : also emit a single combined distributable archive
+      # `ulimit -n` works around a zen-pak file-descriptor crash (SML's
+      # "Fix CI failing due to large open file limit" commit).
+      #   ref: SML build.yml "Package SML Mod"
+      # ---------------------------------------------------------------------
+      - name: Package Cartograph (RunUAT PackagePlugin)
+        run: |
+          set -euo pipefail
+          ulimit -n 1048576 || true
+          "$UE_DIR/Engine/Build/BatchFiles/RunUAT.sh" \
+            -ScriptsForProject="$UPROJECT" \
+            PackagePlugin \
+            -Project="$UPROJECT" \
+            -dlcname="$MOD_REFERENCE" \
+            -merge \
+            -build \
+            -server \
+            -clientconfig=Shipping \
+            -serverconfig=Shipping \
+            -platform=Win64 \
+            -serverplatform=Win64+Linux \
+            -nocompileeditor \
+            -installed \
+            2>&1 | tee "$WORK_DIR/package.log"
+
+      # ---------------------------------------------------------------------
+      # Surface the produced zip path and fail loudly if packaging silently
+      # produced nothing (so the upload step doesn't "succeed" with no files).
+      # ---------------------------------------------------------------------
+      - name: Locate packaged mod
+        id: artifact
+        run: |
+          set -euo pipefail
+          OUT="$PROJECT_DIR/Saved/ArchivedPlugins/$MOD_REFERENCE"
+          echo "Contents of $OUT:"; ls -lh "$OUT" || true
+          if ! ls "$OUT"/*.zip >/dev/null 2>&1; then
+            echo "::error::No packaged .zip found in $OUT — packaging failed."; exit 1
+          fi
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # DOWNLOADABLE ARTIFACT: the packaged mod zip(s). This zip IS the
+      # distributable the ficsit.app mod repository (SMR/SMM) consumes (the .smod
+      # format is effectively this UAT zip).
+      #   compression-level: 0  -> the output is already a zip; re-compressing
+      #                            wastes CPU and barely shrinks it.
+      #   if-no-files-found: error -> belt-and-suspenders with the step above.
+      #   ref: https://github.com/actions/upload-artifact
+      # ---------------------------------------------------------------------
+      - name: Upload packaged mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cartograph-${{ github.sha }}
+          path: ${{ steps.artifact.outputs.out }}/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      # ---------------------------------------------------------------------
+      # Keep build/package logs for post-mortems (Wwise mismatches, UBT errors).
+      # ---------------------------------------------------------------------
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.sha }}
+          path: |
+            ${{ env.WORK_DIR }}/build-editor.log
+            ${{ env.WORK_DIR }}/package.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+# ===========================================================================
+# GITHUB-HOSTED FALLBACK: there is NONE that can compile this mod.
+# A github-hosted ubuntu-latest/windows-latest runner cannot obtain the private
+# 5.6.1-CSS engine (no public installer, ~tens of GB, ephemeral disk, no
+# credentials), so it physically cannot compile Cartograph's C++ GameFeature
+# module. The ONLY honest "hosted" option is to run a self-hosted runner INSIDE
+# a github large-runner-style container image that already bakes the engine +
+# toolchain + Wwise (Option C in CI-SETUP.md) — but that still requires
+# legitimate engine access to build the image, so it is not "github-hosted".
+# Do not add a hosted job that pretends to build; it will always fail at engine
+# acquisition.
+# ===========================================================================
+
