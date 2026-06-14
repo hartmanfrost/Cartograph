@@ -1225,53 +1225,46 @@ void UCartographGameInstanceModule::LoadRuntimeConfig()
 
 	RuntimeConfig = {};
 
-	// std::getline doesn't support std::string_view :(
+	// Parse the comma/pipe/colon-separated config strings with UE-native FString
+	// ops. The previous std::wstringstream/std::getline path only compiled on
+	// Windows, where TCHAR == wchar_t; on Linux TCHAR == char16_t, so a
+	// std::wstringstream (wchar_t) cannot be constructed from *FString.
 	{
-        std::wstringstream Stream{ *ConfigInstance.MainCategoryToggle };
-        std::wstring Line;
-        while (std::getline(Stream, Line, L','))
-        {
-			if (!Line.empty())
+		TArray<FString> Categories;
+		ConfigInstance.MainCategoryToggle.ParseIntoArray(Categories, TEXT(","), /*CullEmpty*/ true);
+		for (const FString& Category : Categories)
+		{
+			RuntimeConfig.DisabledLayerMainCategory.Add(FName{ Category });
+		}
+	}
+	{
+		TArray<FString> MainCategoryLines;
+		ConfigInstance.SubCategoryToggle.ParseIntoArray(MainCategoryLines, TEXT("|"), /*CullEmpty*/ true);
+		for (const FString& MainCategoryLine : MainCategoryLines)
+		{
+			FString MainCategoryName, SubCategoryList;
+			if (!MainCategoryLine.Split(TEXT(":"), &MainCategoryName, &SubCategoryList))
 			{
-				RuntimeConfig.DisabledLayerMainCategory.Add(FName{ Line.data() });
+				CARTO_LOG_ERROR("Invalid SubCategoryToggle: %s", *ConfigInstance.SubCategoryToggle);
+				break;
 			}
-        }
-    }
-    {
-        std::wstringstream Stream{ *ConfigInstance.SubCategoryToggle };
-        std::wstring MainCategoryLine;
-        while (std::getline(Stream, MainCategoryLine, L'|'))
-        {
-			const size_t MainCategoryColonIndex = MainCategoryLine.find(':');
-            if (MainCategoryColonIndex == std::wstring::npos)
-            {
-                CARTO_LOG_ERROR("Invalid BuildingToggle: %s", *ConfigInstance.BuildingToggle);
-                break;
-            }
-            std::wstring MainCategoryName = MainCategoryLine.substr(0, MainCategoryColonIndex);
-            const FName MainCategoryFName{ MainCategoryName.data() };
+			const FName MainCategoryFName{ MainCategoryName };
 
-            std::wstringstream SubCategoryStream{ MainCategoryLine.substr(MainCategoryColonIndex + 1) };
-            std::wstring SubCategoryLine;
-			while (std::getline(SubCategoryStream, SubCategoryLine, L','))
+			TArray<FString> SubCategories;
+			SubCategoryList.ParseIntoArray(SubCategories, TEXT(","), /*CullEmpty*/ true);
+			for (const FString& SubCategory : SubCategories)
 			{
-				if (!SubCategoryLine.empty())
-				{
-					RuntimeConfig.DisabledLayerSubCategory.FindOrAdd(MainCategoryFName).Add(FName{ SubCategoryLine.data() });
-				}
+				RuntimeConfig.DisabledLayerSubCategory.FindOrAdd(MainCategoryFName).Add(FName{ SubCategory });
 			}
-        }
+		}
 	}
 
 	{
-		std::wstringstream Stream{ *ConfigInstance.BuildingToggle };
-		std::wstring Line;
-		while (std::getline(Stream, Line, L','))
+		TArray<FString> Buildings;
+		ConfigInstance.BuildingToggle.ParseIntoArray(Buildings, TEXT(","), /*CullEmpty*/ true);
+		for (const FString& Building : Buildings)
 		{
-			if (!Line.empty())
-			{
-				RuntimeConfig.DisabledLayerBuildable.Add(std::stoul(Line));
-			}
+			RuntimeConfig.DisabledLayerBuildable.Add(static_cast<uint32>(FCString::Strtoui64(*Building, nullptr, 10)));
 		}
 	}
 
