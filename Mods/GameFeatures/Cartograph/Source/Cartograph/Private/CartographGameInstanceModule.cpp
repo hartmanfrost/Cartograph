@@ -538,7 +538,10 @@ void UCartographGameInstanceModule::InitializeSpine(UWorld* World)
 
 			// Start the never-cancelled convergent loop ONCE. It runs until ShutdownSpine
 			// flips the compositor's bRunning false; it is never Cancel()'d (SPEC 4.3).
-			CompositorCoroutine = Compositor.TickConverge();
+			// Pass `this` (a UObject) as the latent context: the compositor is a plain
+			// C++ object and cannot be its own UE5Coro world context, so the owning
+			// module supplies the latent-action Target + world explicitly.
+			CompositorCoroutine = Compositor.TickConverge(this);
 		}
 		else
 		{

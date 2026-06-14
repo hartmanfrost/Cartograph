@@ -83,9 +83,14 @@ public:
 	 * r.Cartograph.FrameBudgetFraction), prioritizing the current AoI. Awaits
 	 * the budget ONCE per tile (or per K buildings within a large tile), never
 	 * per primitive. The coroutine completes only on Shutdown.
-	 * Started once by the owning subsystem.
+	 *
+	 * Started once by the owning subsystem, which passes itself (a UObject) as the
+	 * latent context: the compositor is a plain C++ object, so it cannot be its own
+	 * UE5Coro world context. TLatentContext supplies the latent-action Target + the
+	 * containing UWorld explicitly (implicitly from the owner `this`), bypassing the
+	 * default first-parameter/`this` world detection.
 	 */
-	UE5Coro::TCoroutine<> TickConverge(FForceLatentCoroutine = {});
+	UE5Coro::TCoroutine<> TickConverge(UE5Coro::TLatentContext<> Context);
 
 	/**
 	 * Render exactly one tile NOW (synchronous, no budget). For the compositor's

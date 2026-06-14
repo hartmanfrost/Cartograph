@@ -277,16 +277,23 @@ void FCartographCompositor::SetShowBuildings(bool bShow)
 // -----------------------------------------------------------------------------
 // The never-cancelled convergent loop (SPEC 4.3).
 // -----------------------------------------------------------------------------
-UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(FForceLatentCoroutine)
+UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContext<> Context)
 {
 	using namespace UE5Coro;
 
 	bRunning = true;
 
-	const UWorld* World = nullptr;
+	// World for frame timing. The latent action itself is hosted in Context.World
+	// (the owning subsystem's world); prefer the render target's world if present so
+	// the per-frame delta is read from the exact UWorld the atlas draws into, which
+	// is identical to the legacy path. Both resolve to the same world in practice.
+	const UWorld* World = Context.World;
 	if (const UCanvasRenderTarget2D* RT = RenderTarget.Get())
 	{
-		World = RT->GetWorld();
+		if (UWorld* RTWorld = RT->GetWorld())
+		{
+			World = RTWorld;
+		}
 	}
 
 	// Reused across ticks - the contract says to keep the budget OUTSIDE the loop.
