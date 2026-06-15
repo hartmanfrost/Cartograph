@@ -376,24 +376,22 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 				return;
 			}
 
-			// Dedicated client: kick off the AoI-scoped pull over the replicator
-			// transport (Phase-0). This replaces the deleted slice-RCO request.
-			// The viewport AoI is the whole atlas at join (the client narrows it as
-			// the map UI sets a real viewport). NM_Client only reaches here.
+			// Dedicated client: gather the buildings LOCALLY, the same budgeted
+			// coroutine the host runs. The original re-arch tried a "server computes,
+			// client pulls AoI tiles" path here (ReplComp->RequestAoI), but the
+			// ReliableMessaging transport was never actually wired (SPIKE Q1): the
+			// component is looked up passively and the handshake is never driven, so
+			// RequestAoI silently no-op'd, the client received no tiles, and the map
+			// sat empty at "Initializing..(0%)" forever (InitializeProgress is only
+			// ever written by StreamingGather, which used to be host-only).
+			// Buildables + lightweight instances ARE replicated to clients, so the
+			// client can enumerate them itself; StreamingGather populates the store,
+			// advances InitializeProgress, clears IsInitializing, and SetFullRedraw()s
+			// the atlas. NM_Client only reaches here.
 			ShouldInitialize = false;
 			IsInitializing = true;
 			InitializeSpine(GetWorld());
-
-			if (UCartographMapReplicationComponent* ReplComp =
-				PlayerController->FindComponentByClass<UCartographMapReplicationComponent>())
-			{
-				const FBox2f FullAtlas(FVector2f(0.f, 0.f), FVector2f((float)RENDER_TEXTURE_SIZE, (float)RENDER_TEXTURE_SIZE));
-				ReplComp->RequestAoI(FullAtlas);
-			}
-			else
-			{
-				CARTO_LOG_ERROR("No UCartographMapReplicationComponent on the joining client PC (SPIKE Q1)");
-			}
+			GatherCoroutine = StreamingGather();
         };
 
 
