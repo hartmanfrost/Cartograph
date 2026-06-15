@@ -41,6 +41,7 @@ class UCanvasRenderTarget2D;
 class UCanvas;
 class FCanvas;
 class UTexture2D;
+class UWorld;
 struct FDrawToRenderTargetContext;
 
 
@@ -162,6 +163,13 @@ private:
 	/** GC is the owning subsystem's responsibility; we hold a weak ref so a GC
 	 *  of the atlas during a stall can never dangle a draw. */
 	TWeakObjectPtr<UCanvasRenderTarget2D> RenderTarget;
+
+	/** WorldContextObject for Begin/EndDrawCanvasToRenderTarget. Captured from the
+	 *  TickConverge latent context (the owning subsystem's world). The atlas
+	 *  RenderTarget is a content ASSET, so RT->GetWorld() is null and cannot serve
+	 *  as the context (the legacy module passed the owning UObject instead); we
+	 *  capture the live world here. RenderTile only runs inside TickConverge. */
+	TWeakObjectPtr<UWorld> WorldContext;
 
 	// -------------------------------------------------------------------------
 	// Z-filter range + show flag (member state honored by every RenderTile).

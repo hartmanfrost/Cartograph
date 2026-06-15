@@ -296,6 +296,11 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 		}
 	}
 
+	// Publish the resolved world for RenderTile (which runs only inside this loop).
+	// The atlas RT is a content asset (RT->GetWorld() == null), so RenderTile cannot
+	// resolve the canvas WorldContextObject from it and must use this captured world.
+	WorldContext = Context.World;
+
 	// Reused across ticks - the contract says to keep the budget OUTSIDE the loop.
 	// FTickTimeBudget tracks cycles spent this tick; co_awaiting it yields to the
 	// next tick once the budget is exhausted, otherwise keeps running.
@@ -388,16 +393,17 @@ void FCartographCompositor::RenderTile(FTileId Tile)
 		return;
 	}
 
-	// SPIKE(Q3): the WorldContextObject for Begin/EndDrawCanvasToRenderTarget.
-	// The legacy module passed `this` (a UObject). The compositor is a plain C++
-	// object, so we resolve the world from the render target. This requires the
-	// owning subsystem to have created the RT with a valid world context (e.g.
-	// UCanvasRenderTarget2D::CreateCanvasRenderTarget2D(WorldContext, ...)) so
-	// UCanvasRenderTarget2D::GetWorld() is non-null; verify on the fork.
-	UWorld* World = RT->GetWorld();
+	// The WorldContextObject for Begin/EndDrawCanvasToRenderTarget. The legacy
+	// module passed `this` (a UObject); the compositor is a plain C++ object and the
+	// atlas RenderTarget is a content ASSET, so RT->GetWorld() is null and cannot
+	// serve as the context. Use the world captured by TickConverge (the owning
+	// subsystem's world) — RenderTile only ever runs inside that loop, which sets
+	// WorldContext before the first draw. (This resolves SPIKE Q3 on the fork: the
+	// RT is asset-backed, not created via CreateCanvasRenderTarget2D(World, ...).)
+	UWorld* World = WorldContext.Get();
 	if (!World)
 	{
-		CARTO_LOG_ERROR("RenderTile: render target has no world (RT must be created with a world context)");
+		CARTO_LOG_ERROR("RenderTile: no world context (TickConverge must set WorldContext before drawing)");
 		return;
 	}
 
