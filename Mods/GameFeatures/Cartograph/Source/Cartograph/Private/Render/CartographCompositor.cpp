@@ -53,28 +53,6 @@
 // =============================================================================
 
 
-namespace
-{
-	/** Default per-frame budget if the world / frame delta cannot be read.
-	 *  16.6 ms ~= one 60 fps frame; the fraction is applied on top. */
-	constexpr double DefaultFrameSeconds = 1.0 / 60.0;
-
-	/** Read the current frame's delta seconds for the frame-relative budget. */
-	double GetFrameSeconds(const UWorld* World)
-	{
-		if (World)
-		{
-			const float Delta = World->GetDeltaSeconds();
-			if (Delta > KINDA_SMALL_NUMBER)
-			{
-				return (double)Delta;
-			}
-		}
-		return DefaultFrameSeconds;
-	}
-}
-
-
 void FCartographCompositor::Initialize(
 	FCartographBuildingStore* InStore,
 	FCartographSpatialGrid* InGrid,
@@ -283,85 +261,113 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 
 	bRunning = true;
 
-	// World for frame timing. The latent action itself is hosted in Context.World
-	// (the owning subsystem's world); prefer the render target's world if present so
-	// the per-frame delta is read from the exact UWorld the atlas draws into, which
-	// is identical to the legacy path. Both resolve to the same world in practice.
-	const UWorld* World = Context.World;
-	if (const UCanvasRenderTarget2D* RT = RenderTarget.Get())
-	{
-		if (UWorld* RTWorld = RT->GetWorld())
-		{
-			World = RTWorld;
-		}
-	}
-
-	// Publish the resolved world for RenderTile (which runs only inside this loop).
-	// The atlas RT is a content asset (RT->GetWorld() == null), so RenderTile cannot
-	// resolve the canvas WorldContextObject from it and must use this captured world.
+	// Capture the owning subsystem's world for the per-chunk
+	// Begin/EndDrawCanvasToRenderTarget (EmitTileChunk). The atlas RenderTarget is a
+	// content ASSET, so RT->GetWorld() is null and cannot serve as the canvas
+	// WorldContextObject; Context.World is the live world the atlas draws into.
 	WorldContext = Context.World;
 
-	// Reused across ticks - the contract says to keep the budget OUTSIDE the loop.
-	// FTickTimeBudget tracks cycles spent this tick; co_awaiting it yields to the
-	// next tick once the budget is exhausted, otherwise keeps running.
-	// We rebuild it per tick because the budget is FRAME-RELATIVE (a fraction of
-	// THIS frame's delta), not a fixed ms (SPEC 4.3, issue #10): the frame delta
-	// changes, so the per-tick budget must track it.
-
+	// Reused buffers kept in the coroutine frame so they survive suspensions.
 	TArray<FTileId> PoppedTiles;
+	TArray<FDrawable> Drawables;
 
 	while (bRunning)
 	{
-		// Frame-relative budget for THIS drain batch: FrameBudgetFraction (default
-		// 0.15) of the current frame time - a FRACTION of frame time, NOT an absolute
-		// ms (SPEC 4.3, the correct answer to issue #10). Constructed per while-batch
-		// so it tracks the current frame's delta; FTickTimeBudget::await_resume
-		// auto-resets its clock when the coroutine actually suspends and resumes a
-		// tick later, so awaiting this same object repeatedly across ticks within a
-		// batch is the library's intended usage (hence it lives outside the inner
-		// for, in the coroutine frame, surviving suspensions).
-		const double FrameSeconds = GetFrameSeconds(World);
-		const float BudgetFraction = FMath::Clamp(
-			CVarCartographFrameBudgetFraction.GetValueOnGameThread(), 0.01f, 1.0f);
-		Latent::FTickTimeBudget Budget =
-			Latent::FTickTimeBudget::Seconds(FrameSeconds * (double)BudgetFraction);
-
-		// K = hard cap on tiles per tick so a single frame can never attempt an
-		// unbounded drain even if the soft time budget is generous.
-		const int32 K = FMath::Max(1, CVarCartographTilesPerFrame.GetValueOnGameThread());
-
-		if (TileManager && TileManager->HasDirty())
+		if (!(TileManager && TileManager->HasDirty()))
 		{
-			// PopDirtyTiles clears the popped bits and orders by AoI priority so the
-			// VISIBLE map converges first (SPEC 4.3 backpressure). Tiles re-dirtied
-			// mid-pass simply re-set their bit for a later tick (coalesced).
-			TileManager->PopDirtyTiles(K, PoppedTiles);
+			// Nothing to draw this tick; sleep one tick so the loop never spins the
+			// game thread while the map is quiescent.
+			co_await Latent::NextTick();
+			continue;
+		}
 
-			for (const FTileId Tile : PoppedTiles)
+		const bool bRenderEnabled = CVarCartographRenderEnabled.GetValueOnGameThread();
+
+		// THE GPU/TDR BOUND. EndDrawCanvasToRenderTarget only ENQUEUES an RDG pass, and
+		// the RHI coalesces a frame's passes into ONE GPU submit - so a per-tile (or even
+		// per-chunk) Begin/EndDraw is NOT a separate submit; the FRAME BOUNDARY is. We
+		// therefore cap the building drawables emitted per FRAME and co_await a whole
+		// frame (NextTick) once the cap is hit, so the render thread flushes and the GPU
+		// drains before the next submit. Combined with the per-tile scissor (which clamps
+		// every drawable's fill to one 256px tile), per-frame GPU fill stays
+		// <= budget * tile_area - far under the Steam Deck's ~2-5s GPU TDR window even at
+		// low clocks, no matter how many thousands of buildings pack a single tile. This
+		// replaces the old per-tile FTickTimeBudget, which metered game-thread EMIT cycles
+		// (not GPU execution) and so could not bound a dense tile's submit.
+		int32 FrameBudget = FMath::Max(1, CVarCartographMaxDrawablesPerFrame.GetValueOnGameThread());
+
+		// K still caps how many WHOLE tiles we START per drain pass; PopDirtyTiles orders
+		// by AoI priority so the visible map converges first (SPEC 4.3 backpressure).
+		const int32 K = FMath::Max(1, CVarCartographTilesPerFrame.GetValueOnGameThread());
+		TileManager->PopDirtyTiles(K, PoppedTiles);
+
+		for (const FTileId Tile : PoppedTiles)
+		{
+			if (!bRunning)
+			{
+				break;
+			}
+
+			// Gather this tile's sorted drawables ONCE (pure CPU; opens no canvas). A
+			// LOCAL buffer (not a member) so a chunk slice can never be clobbered across
+			// the NextTick suspensions below. Stays empty when rendering is disabled or
+			// buildings are hidden -> the tile still gets exactly one clear-only chunk.
+			Drawables.Reset();
+			if (bRenderEnabled)
+			{
+				GatherTileDrawables(Tile, Drawables);
+			}
+
+			const int32 Num = Drawables.Num();
+			int32 Offset = 0;
+			bool bFirstChunk = true;
+
+			// Emit the tile in <=FrameBudget-sized chunks. The do/while runs once for an
+			// empty tile so a de-populated / hidden tile still clears (bFirstChunk emits
+			// the clear quad). A dense tile spans several frames via the NextTick below.
+			do
 			{
 				if (!bRunning)
 				{
 					break;
 				}
 
-				// One tile = one Begin/EndDraw = one separate GPU command buffer.
-				// This is the structural TDR fix: the submission for this tile is
-				// bounded to O(buildings in the tile), never the whole factory.
-				RenderTile(Tile);
+				if (bRenderEnabled)
+				{
+					const int32 Take = FMath::Min(FrameBudget, Num - Offset);
+					EmitTileChunk(Tile, Drawables, Offset, Take, bFirstChunk);
+					Offset += Take;
+					FrameBudget -= Take;
+					bFirstChunk = false;
+				}
+				else
+				{
+					// Rendering disabled: consume the tile, touch no GPU.
+					Offset = Num;
+				}
 
-				// Await the budget ONCE PER TILE (not per primitive). This deletes
-				// the legacy ~9*N per-primitive awaiter + FPlatformTime::Cycles()
-				// reads (per-primitive-budget-suspension-overhead). If the budget is
-				// already spent this resumes next tick; otherwise it keeps draining.
-				co_await Budget;
+				// Per-frame budget spent with this tile unfinished: yield a full frame
+				// (forces the submit boundary), then refill for the next frame.
+				if (FrameBudget <= 0 && Offset < Num)
+				{
+					co_await Latent::NextTick();
+					FrameBudget = FMath::Max(1, CVarCartographMaxDrawablesPerFrame.GetValueOnGameThread());
+				}
+			}
+			while (Offset < Num);
+
+			// Budget spent exactly at a tile boundary: yield before the next tile so the
+			// per-frame bound also holds ACROSS tiles (sparse tiles batch up to the cap).
+			if (FrameBudget <= 0)
+			{
+				co_await Latent::NextTick();
+				FrameBudget = FMath::Max(1, CVarCartographMaxDrawablesPerFrame.GetValueOnGameThread());
 			}
 		}
-		else
-		{
-			// Nothing to draw this tick. Sleep one tick so the loop does not spin
-			// the game thread when the map is quiescent.
-			co_await Latent::NextTick();
-		}
+
+		// Always yield once per drain pass so the loop can never hot-spin even when every
+		// popped tile was empty (all clear-only, zero budget consumed).
+		co_await Latent::NextTick();
 	}
 
 	CARTO_LOG_DEBUG("Compositor TickConverge exited cleanly (Shutdown)");
@@ -370,7 +376,32 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 
 
 // -----------------------------------------------------------------------------
-// Render exactly one tile (synchronous, separate command buffer).
+// Publish the per-tile scissor the global FCanvas hook reads.
+// -----------------------------------------------------------------------------
+void FCartographCompositor::SetTileScissor(FTileId Tile)
+{
+	// {MinX, MinY, MaxX, MaxY} in atlas pixels. The global FCanvas::GetBatchedElements
+	// hook (FCartographCanvasRenderItem, SPEC 4.2) reads this and clips every primitive
+	// emitted into our canvas to the tile rect - which also clamps each drawable's GPU
+	// FILL to <= one 256px tile no matter how oversized its footprint is.
+	const FBox2f TileRect = FCartographTileManager::TileRect(Tile);
+	ScissorArea = {
+		(uint32)FMath::Max(0, FMath::FloorToInt(TileRect.Min.X)),
+		(uint32)FMath::Max(0, FMath::FloorToInt(TileRect.Min.Y)),
+		(uint32)FMath::Min(RENDER_TEXTURE_SIZE, FMath::CeilToInt(TileRect.Max.X)),
+		(uint32)FMath::Min(RENDER_TEXTURE_SIZE, FMath::CeilToInt(TileRect.Max.Y))
+	};
+}
+
+
+// -----------------------------------------------------------------------------
+// Render exactly one tile, synchronously, in MaxDrawablesPerFrame chunks.
+//
+// SYNCHRONOUS entry (forced / test redraws only). It does NOT yield between chunks,
+// so for a pathologically dense tile it can submit a lot in one frame; it is therefore
+// kept OFF the hot path. The live drain path is TickConverge, which gathers + emits the
+// same chunks but co_awaits a FRAME between them so every GPU submit is individually
+// bounded (the actual Steam Deck TDR fix). Both share GatherTileDrawables/EmitTileChunk.
 // -----------------------------------------------------------------------------
 void FCartographCompositor::RenderTile(FTileId Tile)
 {
@@ -379,119 +410,59 @@ void FCartographCompositor::RenderTile(FTileId Tile)
 		return;
 	}
 
-	// Dedicated servers render nothing (SPEC 4.5). The owning subsystem normally
-	// never starts the compositor on a dedicated server, but guard defensively so
-	// a stray RenderTile is a no-op rather than a crash.
+	// Dedicated servers render nothing (SPEC 4.5). Guard defensively so a stray
+	// RenderTile is a no-op rather than a crash.
 	if (FPlatformProperties::IsServerOnly())
 	{
 		return;
 	}
 
-	UCanvasRenderTarget2D* RT = RenderTarget.Get();
-	if (!RT)
+	// Master kill switch (r.Cartograph.RenderEnabled 0): issue no GPU work at all.
+	if (!CVarCartographRenderEnabled.GetValueOnGameThread())
 	{
 		return;
 	}
 
-	// The WorldContextObject for Begin/EndDrawCanvasToRenderTarget. The legacy
-	// module passed `this` (a UObject); the compositor is a plain C++ object and the
-	// atlas RenderTarget is a content ASSET, so RT->GetWorld() is null and cannot
-	// serve as the context. Use the world captured by TickConverge (the owning
-	// subsystem's world) — RenderTile only ever runs inside that loop, which sets
-	// WorldContext before the first draw. (This resolves SPIKE Q3 on the fork: the
-	// RT is asset-backed, not created via CreateCanvasRenderTarget2D(World, ...).)
-	UWorld* World = WorldContext.Get();
-	if (!World)
+	TArray<FDrawable> Drawables;
+	GatherTileDrawables(Tile, Drawables);
+
+	const int32 Num = Drawables.Num();
+	const int32 Max = FMath::Max(1, CVarCartographMaxDrawablesPerFrame.GetValueOnGameThread());
+	int32 Offset = 0;
+	bool bFirstChunk = true;
+
+	// do/while runs once for an empty tile so it still clears (bFirstChunk).
+	do
 	{
-		CARTO_LOG_ERROR("RenderTile: no world context (TickConverge must set WorldContext before drawing)");
-		return;
+		const int32 Take = FMath::Min(Max, Num - Offset);
+		EmitTileChunk(Tile, Drawables, Offset, Take, bFirstChunk);
+		Offset += Take;
+		bFirstChunk = false;
 	}
-
-	// Tile pixel rect (ragged edge tiles already clamped to RENDER_TEXTURE_SIZE).
-	const FBox2f TileRect = FCartographTileManager::TileRect(Tile);
-
-	// Publish the scissor BEFORE opening the canvas so the global
-	// FCanvas::GetBatchedElements hook (reused from the legacy
-	// FCartographCanvasRenderItem mechanism, SPEC 4.2) clips every batch emitted
-	// for THIS tile to the tile rect. {MinX, MinY, MaxX, MaxY} in atlas pixels.
-	ScissorArea = {
-		(uint32)FMath::Max(0, FMath::FloorToInt(TileRect.Min.X)),
-		(uint32)FMath::Max(0, FMath::FloorToInt(TileRect.Min.Y)),
-		(uint32)FMath::Min(RENDER_TEXTURE_SIZE, FMath::CeilToInt(TileRect.Max.X)),
-		(uint32)FMath::Min(RENDER_TEXTURE_SIZE, FMath::CeilToInt(TileRect.Max.Y))
-	};
-
-	// Open the canvas for THIS tile only. Each Begin/EndDraw pair is its own GPU
-	// command-buffer submission - the guaranteed TDR bound (SPEC 4.2). We do NOT
-	// batch multiple tiles into one Begin/EndDraw: that would re-merge the
-	// submissions and reopen the TDR window.
-	UCanvas* Canvas = nullptr;
-	FVector2D CanvasSize;
-	FDrawToRenderTargetContext Context;
-	// SPIKE(Q3): UKismetRenderingLibrary::Begin/EndDrawCanvasToRenderTarget signature
-	// (WorldContextObject, RT, out UCanvas*, out FVector2D Size, out FDrawToRenderTargetContext)
-	// matches the legacy module's usage on this fork; confirm the exported overload on
-	// CSS (no Engine/ source on disk). A UWorld* is a valid WorldContextObject.
-	UKismetRenderingLibrary::BeginDrawCanvasToRenderTarget(World, RT, Canvas, CanvasSize, Context);
-	if (!Canvas || !Canvas->Canvas)
-	{
-		CARTO_LOG_ERROR("RenderTile: BeginDrawCanvasToRenderTarget produced a null canvas");
-		ScissorArea = { 0, 0, 0, 0 };
-		return;
-	}
-
-	// CurrentCanvas lets the scissor hook recognise OUR canvas (it scissors only
-	// when Canvas == CurrentCanvas), exactly as the legacy code keyed off
-	// UCartographGameInstanceModule::Instance->CurrentCanvas.
-	CurrentCanvas = Canvas->Canvas;
-
-	DrawTileIntoCanvas(Tile, Canvas);
-
-	// EndDraw flushes THIS tile as a separate command buffer. Because the atlas is
-	// never fully cleared (only this tile's rect was cleared above) and
-	// bAutoGenerateMips=false, no full-texture pass is kicked here.
-	// SPIKE(Q3): if the fork implicitly re-clears the whole target on the NEXT
-	// BeginDraw (preserve-failure), the committed fallback is ClearTileRectViaRHI_ELoad
-	// (ELoad load action + RHI scissor), reachable today via the RHI dep.
-	UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(World, Context);
-
-	CurrentCanvas = nullptr;
-	ScissorArea = { 0, 0, 0, 0 };
+	while (Offset < Num);
 }
 
 
 // -----------------------------------------------------------------------------
-// Draw one tile into an already-open canvas.
+// Gather one tile's sorted drawables (pure CPU; opens no canvas, touches no GPU).
 // -----------------------------------------------------------------------------
-void FCartographCompositor::DrawTileIntoCanvas(FTileId Tile, UCanvas* Canvas)
+void FCartographCompositor::GatherTileDrawables(FTileId Tile, TArray<FDrawable>& Out)
 {
-	const FBox2f TileRect = FCartographTileManager::TileRect(Tile);
+	Out.Reset();
 
-	// (1) Scissored hardware clear bounded to the tile rect. A tile-sized opaque
-	// quad overwrites EXACTLY this tile - ~1 MB of texels at 256 px vs the legacy
-	// full-screen 67 M-texel opaque clear every redraw (fullscreen-clear-every-redraw).
-	// The scissor (set in RenderTile) additionally guarantees no spill beyond the
-	// rect even if the quad rounds outward.
-	{
-		FCanvasTileItem ClearItem(
-			FVector2D(TileRect.Min.X, TileRect.Min.Y),
-			FVector2D(TileRect.Max.X - TileRect.Min.X, TileRect.Max.Y - TileRect.Min.Y),
-			FLinearColor(0.f, 0.f, 0.f, 0.f));  // clear to transparent (matches legacy {0,0,0,0})
-		ClearItem.BlendMode = SE_BLEND_Opaque;
-		Canvas->DrawItem(ClearItem);
-	}
-
+	// Buildings hidden: gather nothing. The caller still emits one clear-only chunk,
+	// the correct converged state for "hide buildings".
 	if (!bShowBuildings)
 	{
-		// Cleared but nothing drawn: the tile is now empty, which is the correct
-		// converged state for "hide buildings".
 		return;
 	}
 
-	// (2) Collect the buildings whose footprint touches this tile (spatial grid),
-	// keep only those inside the active Z range, de-dup multi-cell hits, then draw
-	// BACK-TO-FRONT by Z so overlapping translucent quads composite identically to
-	// the legacy Z-sorted draw (SPEC 4.1/4.2, painters' order; Q12 pixel-identity).
+	const FBox2f TileRect = FCartographTileManager::TileRect(Tile);
+
+	// Collect the buildings whose footprint touches this tile (spatial grid), keep only
+	// those inside the active Z range, de-dup multi-cell hits, then sort BACK-TO-FRONT
+	// by Z so overlapping translucent quads composite identically to the legacy Z-sorted
+	// draw (SPEC 4.1/4.2, painters' order; Q12 pixel-identity).
 	ScratchHandles.Reset();
 
 	// World-space query box for this tile rect (grid is keyed in world cm).
@@ -509,8 +480,8 @@ void FCartographCompositor::DrawTileIntoCanvas(FTileId Tile, UCanvas* Canvas)
 	}
 
 	// The grid returns duplicates for multi-cell buildings and false positives
-	// (cell-granular). De-dup so a building straddling several cells of this tile
-	// is not drawn multiple times (translucent over-draw + wasted work).
+	// (cell-granular). De-dup so a building straddling several cells of this tile is
+	// not drawn multiple times (translucent over-draw + wasted work).
 	TSet<FBuildingHandle> Seen;
 	Seen.Reserve(ScratchHandles.Num());
 
@@ -519,14 +490,7 @@ void FCartographCompositor::DrawTileIntoCanvas(FTileId Tile, UCanvas* Canvas)
 	const float MinZ = MinZFilter;
 	const float MaxZ = MaxZFilter;
 
-	// Drawables collected with their Z so we can sort back-to-front before emitting.
-	struct FDrawable
-	{
-		float Z;
-		FDrawGeometry Geometry;
-	};
-	TArray<FDrawable> Drawables;
-	Drawables.Reserve(ScratchHandles.Num());
+	Out.Reserve(ScratchHandles.Num());
 
 	for (const FBuildingHandle Handle : ScratchHandles)
 	{
@@ -540,9 +504,9 @@ void FCartographCompositor::DrawTileIntoCanvas(FTileId Tile, UCanvas* Canvas)
 		const FBuildingRecord* Record = Store->Find(Handle);
 		if (!Record)
 		{
-			// Stale handle (slot freed/recycled since the grid insert): skip. The
-			// grid is reconciled by the owning subsystem; the generation guard made
-			// Find return null so this is harmless.
+			// Stale handle (slot freed/recycled since the grid insert): skip. The grid
+			// is reconciled by the owning subsystem; the generation guard made Find
+			// return null so this is harmless.
 			continue;
 		}
 
@@ -559,8 +523,8 @@ void FCartographCompositor::DrawTileIntoCanvas(FTileId Tile, UCanvas* Canvas)
 		}
 
 		// Recompute draw geometry from the slim record + class info + side-tables.
-		// PURE: no engine queries, no stored cache (SPEC 4.1). Pixel-identical to
-		// the legacy FillInCache (Q12). Output is already in atlas pixel space.
+		// PURE: no engine queries, no stored cache (SPEC 4.1). Pixel-identical to the
+		// legacy FillInCache (Q12). Output is already in atlas pixel space.
 		FDrawable Drawable;
 		Drawable.Z = WorldZ;
 		if (!FCartographClassDrawTable::ComputeDrawGeometry(*Record, *Info, *Store, Drawable.Geometry))
@@ -569,28 +533,87 @@ void FCartographCompositor::DrawTileIntoCanvas(FTileId Tile, UCanvas* Canvas)
 			continue;
 		}
 
-		Drawables.Emplace(MoveTemp(Drawable));
+		Out.Emplace(MoveTemp(Drawable));
 	}
 
 	// Back-to-front: low Z first, exactly the order the legacy Z-sorted array drew.
-	// Stable so same-Z buildings keep a deterministic (grid-query) order.
-	Algo::StableSortBy(Drawables, &FDrawable::Z);
+	// Stable so same-Z buildings keep a deterministic (grid-query) order. Because the
+	// chunked emit slices this sorted array into CONTIGUOUS ranges and draws them in
+	// order, cross-chunk compositing is identical to a single-pass draw (Q12 preserved).
+	Algo::StableSortBy(Out, &FDrawable::Z);
+}
 
-	for (const FDrawable& Drawable : Drawables)
+
+// -----------------------------------------------------------------------------
+// Render ONE chunk of a tile: a single Begin/EndDrawCanvasToRenderTarget pass.
+// -----------------------------------------------------------------------------
+void FCartographCompositor::EmitTileChunk(FTileId Tile, const TArray<FDrawable>& Drawables, int32 Offset, int32 Count, bool bEmitClear)
+{
+	UCanvasRenderTarget2D* RT = RenderTarget.Get();
+	if (!RT)
 	{
-		DrawGeometry(Canvas, Drawable.Geometry);
+		return;
 	}
 
-	// NOTE on the "await per K buildings within a large tile" half of the contract
-	// (SPEC 4.3): the budget await lives one level up in TickConverge (once per
-	// tile). RenderTile is by contract SYNCHRONOUS / no budget, and a 256 px tile's
-	// building count is naturally bounded, so the per-tile EndDraw submission is the
-	// unit that guarantees the TDR bound. If profiling shows a single tile's
-	// game-thread EMIT time (not GPU time) exceeds the frame budget, the refinement
-	// is to split a dense tile's handle list into fixed-size chunks
-	// across multiple Begin/EndDraw passes with ELoad in TickConverge - the data
-	// path (grid query + ComputeDrawGeometry) is already chunk-friendly. Left as a
-	// documented follow-up rather than speculative complexity.
+	// The WorldContextObject for Begin/EndDrawCanvasToRenderTarget. The atlas RT is a
+	// content ASSET, so RT->GetWorld() is null; use the world TickConverge captured.
+	UWorld* World = WorldContext.Get();
+	if (!World)
+	{
+		CARTO_LOG_ERROR("EmitTileChunk: no world context (TickConverge must set WorldContext before drawing)");
+		return;
+	}
+
+	// Publish the scissor BEFORE opening the canvas so the global hook clips every batch
+	// to the tile rect (and clamps per-drawable GPU fill to <= one tile).
+	SetTileScissor(Tile);
+
+	UCanvas* Canvas = nullptr;
+	FVector2D CanvasSize;
+	FDrawToRenderTargetContext Context;
+	UKismetRenderingLibrary::BeginDrawCanvasToRenderTarget(World, RT, Canvas, CanvasSize, Context);
+	if (!Canvas || !Canvas->Canvas)
+	{
+		CARTO_LOG_ERROR("EmitTileChunk: BeginDrawCanvasToRenderTarget produced a null canvas");
+		ScissorArea = { 0, 0, 0, 0 };
+		return;
+	}
+
+	// CurrentCanvas lets the scissor hook recognise OUR canvas (it scissors only when
+	// Canvas == CurrentCanvas).
+	CurrentCanvas = Canvas->Canvas;
+
+	// (1) Tile-bounded opaque clear - ONLY on the tile's FIRST chunk. Subsequent chunks
+	// of the same tile must NOT clear: they composite onto the prior chunks' pixels,
+	// which the persistent atlas preserves across successive Begin/EndDraw (the SAME
+	// content-preserve the per-tile drain already relies on for every OTHER tile, so no
+	// new assumption). ~1 MB 256px quad vs the legacy full-screen 67 M-texel clear.
+	if (bEmitClear)
+	{
+		const FBox2f TileRect = FCartographTileManager::TileRect(Tile);
+		FCanvasTileItem ClearItem(
+			FVector2D(TileRect.Min.X, TileRect.Min.Y),
+			FVector2D(TileRect.Max.X - TileRect.Min.X, TileRect.Max.Y - TileRect.Min.Y),
+			FLinearColor(0.f, 0.f, 0.f, 0.f));  // clear to transparent (matches legacy {0,0,0,0})
+		ClearItem.BlendMode = SE_BLEND_Opaque;
+		Canvas->DrawItem(ClearItem);
+	}
+
+	// (2) Emit this chunk's slice of the (Z-sorted) drawables. Count==0 is valid: an
+	// empty / hidden tile is just the clear above.
+	const int32 StartIdx = FMath::Max(0, Offset);
+	const int32 EndIdx = FMath::Min(StartIdx + FMath::Max(0, Count), Drawables.Num());
+	for (int32 i = StartIdx; i < EndIdx; ++i)
+	{
+		DrawGeometry(Canvas, Drawables[i].Geometry);
+	}
+
+	// EndDraw enqueues this chunk. The caller co_awaits a FRAME between chunks so the RHI
+	// closes the command buffer and the GPU drains before the next submit (the bound).
+	UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(World, Context);
+
+	CurrentCanvas = nullptr;
+	ScissorArea = { 0, 0, 0, 0 };
 }
 
 
@@ -705,7 +728,7 @@ void FCartographCompositor::DrawGeometry(UCanvas* Canvas, const FDrawGeometry& G
 // COMMITTED Phase-A fallback: scissored, content-preserving (ELoad) tile clear
 // on the render thread (SPEC Q3 / §4.2). Only used IF the persistent-RT preserve
 // acceptance test fails on the fork; otherwise the FCanvas tile-clear quad in
-// DrawTileIntoCanvas already does the bounded clear and this path is unused.
+// EmitTileChunk (first chunk) already does the bounded clear and this path is unused.
 // -----------------------------------------------------------------------------
 void FCartographCompositor::ClearTileRectViaRHI_ELoad(FTileId Tile)
 {

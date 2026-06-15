@@ -203,8 +203,18 @@ private:
 	 *  subsystem; we keep only a weak ref to it. */
 	TArray<TStrongObjectPtr<UTexture2D>> PinnedIcons;
 
-	/** Scratch reused across RenderTile calls to avoid per-tile allocation. */
+	/** Scratch reused across gather calls to avoid per-tile allocation. */
 	TArray<FBuildingHandle> ScratchHandles;
+
+	/** One building's computed draw geometry + its world Z (back-to-front sort key).
+	 *  Promoted from a DrawTileIntoCanvas local so the gather and the chunked emit can
+	 *  pass it across frames: a dense tile is gathered ONCE, then its drawables are
+	 *  emitted in MaxDrawablesPerFrame-sized slices over successive frames. */
+	struct FDrawable
+	{
+		float Z = 0.f;
+		FDrawGeometry Geometry;
+	};
 
 	// -------------------------------------------------------------------------
 	// Internal helpers.
@@ -215,10 +225,21 @@ private:
 	 *  init / on an explicit full-redraw, never inside the per-tile loop. */
 	void ResolveAndPinIcons();
 
-	/** Draw one tile into an already-open FCanvas (Begin/EndDraw done by caller).
-	 *  Issues the tile-bounded opaque clear quad, then the grid+Z-band-filtered
-	 *  buildings clipped to the tile rect. Big-O: O(buildings in tile). */
-	void DrawTileIntoCanvas(FTileId Tile, UCanvas* Canvas);
+	/** Collect this tile's buildings (grid query + de-dup + Z-filter + ComputeDrawGeometry)
+	 *  and append them, sorted back-to-front by Z, to Out. PURE CPU - opens no canvas,
+	 *  touches no GPU. Returns empty when buildings are hidden. Big-O: O(buildings in tile). */
+	void GatherTileDrawables(FTileId Tile, TArray<FDrawable>& Out);
+
+	/** Publish the per-tile scissor {MinX,MinY,MaxX,MaxY} (atlas px) the global FCanvas
+	 *  hook reads, so every primitive in the next Begin/EndDraw is clipped to this tile. */
+	void SetTileScissor(FTileId Tile);
+
+	/** Render ONE chunk of a tile: open a Begin/EndDrawCanvasToRenderTarget pass scissored
+	 *  to the tile, optionally emit the tile-bounded clear quad (bEmitClear, true only for
+	 *  the tile's FIRST chunk), draw the [Offset, Offset+Count) slice of Drawables, EndDraw.
+	 *  Each call is one canvas flush; the caller bounds Count and yields a frame between
+	 *  chunks so no single GPU submit can exceed the TDR window. */
+	void EmitTileChunk(FTileId Tile, const TArray<FDrawable>& Drawables, int32 Offset, int32 Count, bool bEmitClear);
 
 	/** Draw the geometry of one building (already computed) into the canvas.
 	 *  Pure FCanvas item emission; no awaits, no allocation beyond the spline. */

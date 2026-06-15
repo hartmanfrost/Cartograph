@@ -35,3 +35,27 @@ TAutoConsoleVariable<bool> CVarCartographPersistSpatialCache(
 	TEXT("When true, persist grid + slim records via IFGSaveInterface to skip the O(N) cold re-bucket.\n")
 	TEXT("Default OFF; recomputable cache, never a correctness dependency."),
 	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarCartographMaxDrawablesPerFrame(
+	TEXT("r.Cartograph.MaxDrawablesPerFrame"),
+	128,
+	TEXT("Hard cap on building drawables emitted into the atlas per compositor frame.\n")
+	TEXT("The drain loop co_awaits a FULL frame (NextTick) once this many drawables have\n")
+	TEXT("been emitted, so a dense tile is painted progressively over several frames.\n")
+	TEXT("This is the real GPU/TDR bound: EndDrawCanvasToRenderTarget only ENQUEUES an RDG\n")
+	TEXT("pass (the RHI coalesces a frame's passes into one submit), so the FRAME BOUNDARY -\n")
+	TEXT("not the per-tile Begin/EndDraw - is what bounds a single GPU submit. With the\n")
+	TEXT("per-tile scissor clamping each drawable's fill to one 256px tile, per-frame fill is\n")
+	TEXT("<= cap * tile_area, far under the Steam Deck's ~2-5s TDR window even at low clocks.\n")
+	TEXT("Lower it if the Deck stutters; raise it to converge faster. Clamped >= 1."),
+	ECVF_Default);
+
+TAutoConsoleVariable<bool> CVarCartographRenderEnabled(
+	TEXT("r.Cartograph.RenderEnabled"),
+	true,
+	TEXT("Master switch for the compositor draw. When false the drain loop still consumes\n")
+	TEXT("dirty tiles (so the dirty set cannot grow unboundedly) but issues NO\n")
+	TEXT("Begin/EndDrawCanvasToRenderTarget at all - the client touches the GPU zero times.\n")
+	TEXT("A safe escape hatch: if rendering ever misbehaves, `r.Cartograph.RenderEnabled 0`\n")
+	TEXT("in the console leaves the map blank but the game perfectly stable."),
+	ECVF_Default);

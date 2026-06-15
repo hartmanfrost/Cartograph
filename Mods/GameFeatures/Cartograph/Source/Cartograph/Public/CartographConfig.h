@@ -154,6 +154,24 @@ extern TAutoConsoleVariable<int32> CVarCartographTilesPerFrame;
  */
 extern TAutoConsoleVariable<bool> CVarCartographPersistSpatialCache;
 
+/**
+ * r.Cartograph.MaxDrawablesPerFrame (int, default 128).
+ * Hard cap on building drawables emitted per compositor frame; the drain loop yields
+ * a full frame (NextTick) after this many, painting dense tiles progressively. This is
+ * the per-frame GPU bound that prevents the Steam Deck GPU TDR: EndDrawCanvasToRenderTarget
+ * only enqueues an RDG pass (the RHI coalesces a frame's passes into one submit), so the
+ * frame boundary is the true submit bound; with the per-tile scissor clamping each
+ * drawable's fill to one tile, per-frame fill <= cap * tile_area. Clamped >= 1.
+ */
+extern TAutoConsoleVariable<int32> CVarCartographMaxDrawablesPerFrame;
+
+/**
+ * r.Cartograph.RenderEnabled (bool, default true).
+ * Master switch for the compositor draw. False = drain dirty tiles WITHOUT any
+ * Begin/EndDraw (blank map, zero GPU work) - the escape hatch if rendering misbehaves.
+ */
+extern TAutoConsoleVariable<bool> CVarCartographRenderEnabled;
+
 
 // -----------------------------------------------------------------------------
 // Convenience accessors (inline, header-safe).
