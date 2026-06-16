@@ -68,6 +68,12 @@ void FCartographCompositor::Initialize(
 	TileManager = InTileManager;
 	RenderTarget = InRenderTarget;
 
+	// Reset the map-open gate for THIS world. The compositor (and bMapOpen) is a
+	// persistent module member, so without this a reconnect would keep the gate from a
+	// previous session's map-open and re-render the whole new-world stream-in (the OOM).
+	// Each world starts closed: nothing draws until the player opens the map.
+	bMapOpen = false;
+
 	if (!IsReady())
 	{
 		CARTO_LOG_ERROR("FCartographCompositor::Initialize called with a null dependency or render target");
