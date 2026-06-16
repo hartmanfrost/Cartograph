@@ -252,6 +252,15 @@ void FCartographCompositor::SetShowBuildings(bool bShow)
 }
 
 
+void FCartographCompositor::SetMapOpen(bool bOpen)
+{
+	bMapOpen = bOpen;
+	// The caller (the owning module) marks the tiles dirty (SetFullRedraw) when it
+	// opens the map so the just-enabled drain has the current state to paint. While
+	// closed we draw nothing; dirty tiles accumulate harmlessly until the next open.
+}
+
+
 // -----------------------------------------------------------------------------
 // The never-cancelled convergent loop (SPEC 4.3).
 // -----------------------------------------------------------------------------
@@ -273,10 +282,17 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 
 	while (bRunning)
 	{
-		if (!(TileManager && TileManager->HasDirty()))
+		// Gate on the map being OPEN. While it is CLOSED the loop idles and dirty tiles
+		// just accumulate (coalesced in the bitset) WITHOUT being drawn. This is the
+		// megabase Steam Deck OOM fix: on join the client streams in ~18k buildings,
+		// each re-dirtying tiles; rendering that whole atlas continuously (map not even
+		// open) backed the render-thread queue up until the GameThread was OOM-killed.
+		// Painting only while the map is open makes the drain CONVERGE - a finite dirty
+		// set, painted once - instead of churning forever.
+		if (!bMapOpen || !(TileManager && TileManager->HasDirty()))
 		{
 			// Nothing to draw this tick; sleep one tick so the loop never spins the
-			// game thread while the map is quiescent.
+			// game thread while the map is closed or quiescent.
 			co_await Latent::NextTick();
 			continue;
 		}

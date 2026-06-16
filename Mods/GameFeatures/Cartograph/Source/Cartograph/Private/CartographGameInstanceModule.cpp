@@ -386,8 +386,9 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 			// ever written by StreamingGather, which used to be host-only).
 			// Buildables + lightweight instances ARE replicated to clients, so the
 			// client can enumerate them itself; StreamingGather populates the store,
-			// advances InitializeProgress, clears IsInitializing, and SetFullRedraw()s
-			// the atlas. NM_Client only reaches here.
+			// advances InitializeProgress and clears IsInitializing. It does NOT paint
+			// the atlas - the compositor draws only while the map is open (SetMapOpen),
+			// so the megabase stream-in cannot OOM the client. NM_Client only reaches here.
 			ShouldInitialize = false;
 			IsInitializing = true;
 			InitializeSpine(GetWorld());
@@ -1119,11 +1120,11 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::StreamingGather(FForceLaten
 
 	IsInitializing = false;
 
-	if (!bIsDedicatedServer)
-	{
-		// Drain everything via the never-cancelled compositor (bounded per tile).
-		Compositor.SetFullRedraw();
-	}
+	// NOTE: we deliberately do NOT redraw on join anymore. The compositor paints ONLY
+	// while the map UI is open (Compositor.SetMapOpen, wired from
+	// OnCartographMenuButtonClicked). Marking the whole atlas dirty here and draining it
+	// while the map is CLOSED - as ~18k buildings stream in on a megabase - is what
+	// OOM-killed the client. The first map-open issues SetFullRedraw and paints once.
 }
 
 
@@ -1424,6 +1425,21 @@ void UCartographGameInstanceModule::OnCartographMenuButtonClicked(UUserWidget* W
 		{
 			ChildWidget->SetVisibility(IsOpen ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 			break;
+		}
+	}
+
+	// Gate the compositor draw on the map being open (megabase Steam Deck OOM fix):
+	// the atlas is painted only while the map UI is visible. On open, mark everything
+	// dirty so the just-enabled drain paints the current state once; on close, the
+	// drain pauses (dirty tiles accumulate harmlessly until the next open). This stops
+	// the client from continuously re-rendering the whole atlas as ~18k buildings
+	// stream in on join with the map not even open.
+	if (!bIsDedicatedServer)
+	{
+		Compositor.SetMapOpen(IsOpen);
+		if (IsOpen)
+		{
+			Compositor.SetFullRedraw();
 		}
 	}
 

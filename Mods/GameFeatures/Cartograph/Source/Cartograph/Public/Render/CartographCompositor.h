@@ -109,6 +109,18 @@ public:
 	 */
 	void SetFullRedraw();
 
+	/**
+	 * Gate the drain on whether the map UI is OPEN. While the map is CLOSED the
+	 * never-cancelled loop idles: dirty tiles still accumulate (coalesced in the
+	 * bitset) but NOTHING is drawn. This is the load-bearing fix for the megabase
+	 * Steam Deck OOM/crash - on join the client streams in ~18k buildings, each
+	 * re-dirtying tiles; rendering that whole atlas continuously (with the map not
+	 * even open) backed up the render-thread queue until the GameThread was
+	 * OOM-killed. Drawing only when the map is open makes the drain CONVERGE (a
+	 * finite dirty set, painted once) instead of churning forever. The owning
+	 * module calls this from OnCartographMenuButtonClicked. */
+	void SetMapOpen(bool bOpen);
+
 	// -------------------------------------------------------------------------
 	// Filters that affect what RenderTile draws. Setting these marks the
 	// affected tiles dirty so the change converges without a full clear.
@@ -177,6 +189,10 @@ private:
 	float MinZFilter = -TNumericLimits<float>::Max();
 	float MaxZFilter = TNumericLimits<float>::Max();
 	bool bShowBuildings = true;
+
+	/** Drain gate: the loop only paints while the map UI is open (see SetMapOpen).
+	 *  Default false so nothing is drawn on join/while the map is closed. */
+	bool bMapOpen = false;
 
 	// -------------------------------------------------------------------------
 	// Scissor mechanism state (SPEC 4.2: reuse the CartographCanvasRenderItem
