@@ -74,6 +74,7 @@ void FCartographCompositor::Initialize(
 	LastObservedEpoch = 0;
 	StableTicks = 0;
 	TicksSinceDirty = 0;
+	DirtyHighWater = 0;
 
 	if (!IsReady())
 	{
@@ -280,6 +281,27 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 
 	while (bRunning)
 	{
+		// ---------------------------------------------------------------------
+		// On-screen status (top-right map text). Reuse the IsInitializing/InitializeProgress
+		// UPROPERTYs the UMG already renders as "Initializing..(N%)". Progress reads ~0% while
+		// the dirty set grows (buildings streaming in), climbs to 100% as the drain paints it
+		// down, then the text hides once the map is fully converged.
+		// ---------------------------------------------------------------------
+		if (UCartographGameInstanceModule* Module = UCartographGameInstanceModule::Instance)
+		{
+			const int32 DirtyNow = TileManager ? TileManager->DirtyNum() : 0;
+			if (DirtyNow > 0)
+			{
+				DirtyHighWater = FMath::Max(DirtyHighWater, DirtyNow);
+				Module->SetMapBuildStatus(true, 1.0f - (float)DirtyNow / (float)FMath::Max(1, DirtyHighWater));
+			}
+			else
+			{
+				DirtyHighWater = 0;
+				Module->SetMapBuildStatus(false, 1.0f);
+			}
+		}
+
 		// ---------------------------------------------------------------------
 		// DEBOUNCE GATE (replaces the unreliable bMapOpen map-open gate).
 		//

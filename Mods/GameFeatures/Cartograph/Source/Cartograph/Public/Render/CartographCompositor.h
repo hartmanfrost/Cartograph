@@ -204,6 +204,12 @@ private:
 	 *  through the join stream and OOM-killed the client. */
 	int32 TicksSinceDirty = 0;
 
+	/** High-water mark of the dirty-tile count since the last fully-converged (quiescent)
+	 *  state. Drives the on-screen status percent: progress = 1 - dirtyNow/highWater, so it
+	 *  reads ~0% while the dirty set grows (buildings streaming in) and climbs to 100% as the
+	 *  drain paints it down. Reset to 0 when the set empties. */
+	int32 DirtyHighWater = 0;
+
 	// -------------------------------------------------------------------------
 	// Scissor mechanism state (SPEC 4.2: reuse the CartographCanvasRenderItem
 	// ScissorArea path). Public-by-friend so the global FCanvas::GetBatchedElements

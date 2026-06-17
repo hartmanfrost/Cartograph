@@ -316,6 +316,16 @@ private:
 public:
 	inline static UCartographGameInstanceModule* Instance = nullptr;
 
+	/** Drive the top-right map status text (reuses the IsInitializing/InitializeProgress
+	 *  UPROPERTYs the UMG already binds as "Initializing..(N%)"). The compositor calls this
+	 *  each tick to surface map-build convergence: bActive shows/hides the text, Progress
+	 *  (0..1) fills the percent. Display-only; IsInitializing has no control-flow readers. */
+	void SetMapBuildStatus(bool bActive, float Progress)
+	{
+		IsInitializing = bActive;
+		InitializeProgress = Progress;
+	}
+
 	FRuntimeConfig RuntimeConfig;
 
 #pragma region Static Data
