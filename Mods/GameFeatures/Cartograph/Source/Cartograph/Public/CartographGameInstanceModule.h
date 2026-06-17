@@ -293,16 +293,12 @@ private:
 	UFUNCTION()
 	TArray<FString> GetLayerCategoryOptions() const;
 
-	// Fired by the SML Hook_MapMenu_Cartograph hook on Widget_MapContainer_C when the
-	// vanilla game map OPENS. Enables the compositor drain + full redraw so the atlas
-	// is painted while on screen (NOT during the closed-map join stream = megabase OOM).
-	// Non-const because it mutates the Compositor member (drain gate / dirty set).
+	// Bound BY NAME from the SML Hook_MapMenu_Cartograph blueprint asset (the vanilla
+	// map-open hook). MUST exist for that .uasset to cook even though the hook does not
+	// fire at runtime on the current SDK. Does only UI bookkeeping (no compositor); the
+	// render is data-driven + debounced, not gated on map-open.
 	UFUNCTION(BlueprintCallable)
-	void OnVanillaMapMenuShown(const UUserWidget* Widget);
-
-	// Fired by the same hook when the vanilla game map CLOSES. Pauses the drain.
-	UFUNCTION(BlueprintCallable)
-	void OnVanillaMapMenuHidden(const UUserWidget* Widget);
+	void OnVanillaMapMenuShown(const UUserWidget* Widget) const;
 
 
 	template<typename T>

@@ -172,6 +172,25 @@ extern TAutoConsoleVariable<int32> CVarCartographMaxDrawablesPerFrame;
  */
 extern TAutoConsoleVariable<bool> CVarCartographRenderEnabled;
 
+/**
+ * r.Cartograph.DrainDebounceTicks (int, default 30).
+ * Settle window: the never-cancelled compositor only drains once the TileManager dirty
+ * EPOCH has been unchanged for this many consecutive ticks (the build/stream-in has
+ * settled). The rework's debounce-via-epoch analogue of the original mod's
+ * debounce-via-cancel - keeps the megabase join first-paint O(N) (render once after the
+ * ~18k-building stream settles) instead of O(N^2) (re-render a dense tile per streamed
+ * building -> render-thread backlog -> client OOM). Clamped >= 0.
+ */
+extern TAutoConsoleVariable<int32> CVarCartographDrainDebounceTicks;
+
+/**
+ * r.Cartograph.DrainMaxWaitTicks (int, default 1800).
+ * Max-wait fallback so the debounce cannot starve under constant change: if the dirty
+ * epoch keeps advancing every tick, drain anyway once this many ticks have elapsed since
+ * the dirty set first became non-empty (then reset). ~30 s at 60 fps. Clamped >= 1.
+ */
+extern TAutoConsoleVariable<int32> CVarCartographDrainMaxWaitTicks;
+
 
 // -----------------------------------------------------------------------------
 // Convenience accessors (inline, header-safe).

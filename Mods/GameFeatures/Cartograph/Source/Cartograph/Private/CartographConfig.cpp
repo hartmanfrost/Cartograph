@@ -59,3 +59,30 @@ TAutoConsoleVariable<bool> CVarCartographRenderEnabled(
 	TEXT("A safe escape hatch: if rendering ever misbehaves, `r.Cartograph.RenderEnabled 0`\n")
 	TEXT("in the console leaves the map blank but the game perfectly stable."),
 	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarCartographDrainDebounceTicks(
+	TEXT("r.Cartograph.DrainDebounceTicks"),
+	30,
+	TEXT("Settle window (in game-thread ticks) the never-cancelled compositor waits before\n")
+	TEXT("it drains the dirty-tile set. While buildings STREAM in on join (~18k on a megabase),\n")
+	TEXT("every MarkDirtyForBox advances the TileManager dirty EPOCH; the compositor only starts\n")
+	TEXT("draining once the epoch has been UNCHANGED for this many consecutive ticks (the stream\n")
+	TEXT("has settled). This is the rework's debounce-via-epoch analogue of the original mod's\n")
+	TEXT("debounce-via-cancel (RedrawMap cancels the in-progress redraw on each change), and is\n")
+	TEXT("what keeps first-paint O(N) instead of O(N^2): a dense tile re-dirtied by hundreds of\n")
+	TEXT("streamed buildings is rendered ONCE after settling, not once per streamed building.\n")
+	TEXT("Clamped >= 0 (0 = drain immediately, no debounce)."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarCartographDrainMaxWaitTicks(
+	TEXT("r.Cartograph.DrainMaxWaitTicks"),
+	9000,
+	TEXT("Max-wait fallback (in game-thread ticks) so the debounce can never starve the drain\n")
+	TEXT("under CONSTANT change. If the dirty epoch keeps advancing every tick the settle window\n")
+	TEXT("never closes; once this many ticks have elapsed since the dirty set first became non-empty,\n")
+	TEXT("the compositor drains anyway. MUST be comfortably LONGER than a megabase join stream-in\n")
+	TEXT("(~1 min): if it fires mid-stream it latches a CONTINUOUS drain during active streaming,\n")
+	TEXT("which is exactly the O(N^2)/OOM this debounce exists to avoid. 9000 ticks is ~2.5 min at\n")
+	TEXT("60 fps / ~5 min at 30 fps - past any realistic stream-in. Normal play settles via the\n")
+	TEXT("0.5 s debounce long before this; this is only a theoretical anti-starvation floor. Clamped >= 1."),
+	ECVF_Default);

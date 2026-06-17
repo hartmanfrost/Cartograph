@@ -68,11 +68,13 @@ void FCartographCompositor::Initialize(
 	TileManager = InTileManager;
 	RenderTarget = InRenderTarget;
 
-	// Reset the map-open gate for THIS world. The compositor (and bMapOpen) is a
-	// persistent module member, so without this a reconnect would keep the gate from a
-	// previous session's map-open and re-render the whole new-world stream-in (the OOM).
-	// Each world starts closed: nothing draws until the player opens the map.
-	bMapOpen = false;
+	// Reset the drain-debounce state for THIS world. The compositor is a persistent
+	// module member, so a reconnect must not carry a previous session's settle/wait
+	// counters into the new world's stream-in.
+	LastObservedEpoch = 0;
+	StableTicks = 0;
+	TicksSinceDirty = 0;
+	bDraining = false;
 
 	if (!IsReady())
 	{
@@ -258,15 +260,6 @@ void FCartographCompositor::SetShowBuildings(bool bShow)
 }
 
 
-void FCartographCompositor::SetMapOpen(bool bOpen)
-{
-	bMapOpen = bOpen;
-	// The caller (the owning module) marks the tiles dirty (SetFullRedraw) when it
-	// opens the map so the just-enabled drain has the current state to paint. While
-	// closed we draw nothing; dirty tiles accumulate harmlessly until the next open.
-}
-
-
 // -----------------------------------------------------------------------------
 // The never-cancelled convergent loop (SPEC 4.3).
 // -----------------------------------------------------------------------------
@@ -288,19 +281,78 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 
 	while (bRunning)
 	{
-		// Gate on the map being OPEN. While it is CLOSED the loop idles and dirty tiles
-		// just accumulate (coalesced in the bitset) WITHOUT being drawn. This is the
-		// megabase Steam Deck OOM fix: on join the client streams in ~18k buildings,
-		// each re-dirtying tiles; rendering that whole atlas continuously (map not even
-		// open) backed the render-thread queue up until the GameThread was OOM-killed.
-		// Painting only while the map is open makes the drain CONVERGE - a finite dirty
-		// set, painted once - instead of churning forever.
-		if (!bMapOpen || !(TileManager && TileManager->HasDirty()))
+		// ---------------------------------------------------------------------
+		// DEBOUNCE GATE (replaces the unreliable bMapOpen map-open gate).
+		//
+		// The loop renders on data-change like the ORIGINAL mod (which redrew on every
+		// SML AddBuildable/AddFromReplicatedData hook), but DEBOUNCES so the megabase
+		// join first-paint stays O(N): on join ~18k buildings STREAM in over ~1 min,
+		// each calling MarkDirtyForBox which bumps the TileManager dirty EPOCH. We only
+		// drain once that epoch has been STABLE for DrainDebounceTicks ticks (the stream
+		// has SETTLED) - so a dense tile re-dirtied by hundreds of streamed buildings is
+		// rendered ONCE after settling, not once per building (the O(N^2) render-thread
+		// backlog that OOM-killed the client). A DrainMaxWaitTicks fallback guarantees
+		// the map still converges under CONSTANT change (the settle window never closing).
+		// This is the rework's debounce-via-epoch analogue of the original's
+		// debounce-via-cancel (RedrawMap cancels the in-progress redraw on each change).
+		// ---------------------------------------------------------------------
+		if (!(TileManager && TileManager->HasDirty()))
 		{
-			// Nothing to draw this tick; sleep one tick so the loop never spins the
-			// game thread while the map is closed or quiescent.
+			// Quiescent: nothing dirty. Reset the debounce counters + the drain latch and
+			// idle one tick so the loop never hot-spins the game thread.
+			StableTicks = 0;
+			TicksSinceDirty = 0;
+			bDraining = false;
+			LastObservedEpoch = TileManager ? TileManager->GetDirtyEpoch() : LastObservedEpoch;
 			co_await Latent::NextTick();
 			continue;
+		}
+
+		// If we are NOT already mid-drain, run the debounce gate. Once a burst commits to
+		// draining (bDraining latched below), skip the gate and keep popping every tick
+		// until the dirty set empties, so a large set converges at K tiles/frame instead
+		// of re-waiting DrainDebounceTicks after every pop.
+		if (!bDraining)
+		{
+			// Something is dirty. Advance the max-wait timer and update the settle counter.
+			++TicksSinceDirty;
+
+			const uint64 Epoch = TileManager->GetDirtyEpoch();
+			if (Epoch != LastObservedEpoch)
+			{
+				// The dirty set changed this tick (a build hook / streamed building marked
+				// a new tile): the burst is still in flight, restart the settle window.
+				LastObservedEpoch = Epoch;
+				StableTicks = 0;
+			}
+			else
+			{
+				++StableTicks;
+			}
+
+			const int32 DebounceTicks = FMath::Max(0, CVarCartographDrainDebounceTicks.GetValueOnGameThread());
+			const int32 MaxWaitTicks = FMath::Max(1, CVarCartographDrainMaxWaitTicks.GetValueOnGameThread());
+
+			// Drain only when the dirty set has SETTLED (stable for DebounceTicks) OR the
+			// max-wait fallback has elapsed (constant change). Otherwise idle one tick and
+			// keep waiting - dirty tiles stay coalesced in the bitset, painted once below.
+			const bool bSettled = StableTicks >= DebounceTicks;
+			const bool bMaxWaitElapsed = TicksSinceDirty >= MaxWaitTicks;
+			if (!bSettled && !bMaxWaitElapsed)
+			{
+				co_await Latent::NextTick();
+				continue;
+			}
+
+			// Commit to draining this settled (or max-wait-forced) burst. Latch bDraining
+			// so subsequent ticks keep popping without re-arming the debounce, and reset
+			// the timers so the NEXT burst (after this drain completes) debounces afresh.
+			bDraining = true;
+			StableTicks = 0;
+			TicksSinceDirty = 0;
+			// Diagnostic: confirms (in the runtime log) that the atlas paint actually fired
+			// after the dirty set settled - the signal that was MISSING in v2.0.3/2.0.4.
+			CARTO_LOG("Compositor drain starting (dirty set settled%s)", bMaxWaitElapsed ? TEXT(", max-wait forced") : TEXT(""));
 		}
 
 		const bool bRenderEnabled = CVarCartographRenderEnabled.GetValueOnGameThread();

@@ -109,18 +109,6 @@ public:
 	 */
 	void SetFullRedraw();
 
-	/**
-	 * Gate the drain on whether the map UI is OPEN. While the map is CLOSED the
-	 * never-cancelled loop idles: dirty tiles still accumulate (coalesced in the
-	 * bitset) but NOTHING is drawn. This is the load-bearing fix for the megabase
-	 * Steam Deck OOM/crash - on join the client streams in ~18k buildings, each
-	 * re-dirtying tiles; rendering that whole atlas continuously (with the map not
-	 * even open) backed up the render-thread queue until the GameThread was
-	 * OOM-killed. Drawing only when the map is open makes the drain CONVERGE (a
-	 * finite dirty set, painted once) instead of churning forever. The owning
-	 * module calls this from OnCartographMenuButtonClicked. */
-	void SetMapOpen(bool bOpen);
-
 	// -------------------------------------------------------------------------
 	// Filters that affect what RenderTile draws. Setting these marks the
 	// affected tiles dirty so the change converges without a full clear.
@@ -190,9 +178,35 @@ private:
 	float MaxZFilter = TNumericLimits<float>::Max();
 	bool bShowBuildings = true;
 
-	/** Drain gate: the loop only paints while the map UI is open (see SetMapOpen).
-	 *  Default false so nothing is drawn on join/while the map is closed. */
-	bool bMapOpen = false;
+	// -------------------------------------------------------------------------
+	// Drain DEBOUNCE state (replaces the unreliable bMapOpen map-open gate). The
+	// loop renders on data-change like the original mod, but waits for the dirty
+	// EPOCH (FCartographTileManager::GetDirtyEpoch) to be STABLE for
+	// r.Cartograph.DrainDebounceTicks ticks (the stream/build burst settled) before
+	// draining, with an r.Cartograph.DrainMaxWaitTicks fallback so constant change
+	// cannot starve the drain. This keeps the megabase first-paint O(N) instead of
+	// O(N^2) without depending on the (unreliable on this SDK) map-open hook.
+	// -------------------------------------------------------------------------
+
+	/** Dirty epoch observed on the previous tick; if unchanged this tick, the dirty
+	 *  set is settling (StableTicks advances). Re-read every tick from the manager. */
+	uint64 LastObservedEpoch = 0;
+
+	/** Consecutive ticks the dirty epoch has been unchanged. Drain fires once this
+	 *  reaches DrainDebounceTicks. Reset to 0 whenever the epoch advances. */
+	int32 StableTicks = 0;
+
+	/** Ticks elapsed since the dirty set first became non-empty without a drain. The
+	 *  max-wait fallback forces a drain once this reaches DrainMaxWaitTicks so constant
+	 *  change never starves the map. Reset to 0 on every drain and while quiescent. */
+	int32 TicksSinceDirty = 0;
+
+	/** True once a settled (or max-wait-forced) burst has begun draining: keeps the loop
+	 *  popping K tiles every tick until the dirty set empties, WITHOUT re-arming the
+	 *  debounce between PopDirtyTiles passes. Without this latch a large dirty set would
+	 *  re-wait DrainDebounceTicks after every K-tile pop, so convergence would crawl.
+	 *  Cleared when the dirty set is fully drained (back to the debounce gate). */
+	bool bDraining = false;
 
 	// -------------------------------------------------------------------------
 	// Scissor mechanism state (SPEC 4.2: reuse the CartographCanvasRenderItem

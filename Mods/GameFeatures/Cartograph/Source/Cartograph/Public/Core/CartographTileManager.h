@@ -61,6 +61,16 @@ public:
 	/** True iff any tile is dirty. */
 	bool HasDirty() const;
 
+	/**
+	 * Monotonic "dirty epoch": advanced by EVERY Mark* that actually sets a previously
+	 * clear bit (the single choke point MarkDirtyInternal). The compositor reads this to
+	 * DEBOUNCE its drain - it only paints once the epoch has been STABLE for N ticks (the
+	 * stream/build burst has settled), the rework's analogue of the original mod's
+	 * debounce-via-cancel. O(1). Wraps harmlessly (only equality across consecutive ticks
+	 * is tested, never magnitude). Starts at 0; the first mark makes it non-zero.
+	 */
+	uint64 GetDirtyEpoch() const;
+
 	// -------------------------------------------------------------------------
 	// Versioning (server-side). Monotonic uint64 per tile (SPEC Q8: counter,
 	// NOT a content hash on the hot path).
@@ -127,4 +137,9 @@ private:
 
 	/** Linear scan cursor for the non-AoI PopDirtyTiles drain (amortized O(K)). */
 	int32 PopCursor = 0;
+
+	/** Monotonic dirty epoch (see GetDirtyEpoch). Bumped in MarkDirtyInternal on every
+	 *  0->1 bit transition so each MarkDirtyForBox during the stream-in advances it; the
+	 *  compositor debounces its drain on this being stable across ticks. */
+	uint64 DirtyEpoch = 0;
 };

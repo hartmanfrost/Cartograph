@@ -386,9 +386,11 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 			// ever written by StreamingGather, which used to be host-only).
 			// Buildables + lightweight instances ARE replicated to clients, so the
 			// client can enumerate them itself; StreamingGather populates the store,
-			// advances InitializeProgress and clears IsInitializing. It does NOT paint
-			// the atlas - the compositor draws only while the map is open (SetMapOpen),
-			// so the megabase stream-in cannot OOM the client. NM_Client only reaches here.
+			// advances InitializeProgress, clears IsInitializing, and first-paints via
+			// SetFullRedraw. The compositor DEBOUNCES that paint on the TileManager dirty
+			// epoch (r.Cartograph.DrainDebounceTicks), so it converges once AFTER the
+			// ~18k-building stream settles - O(N), not the O(N^2) per-streamed-building
+			// re-render that OOM-killed the client. NM_Client only reaches here.
 			ShouldInitialize = false;
 			IsInitializing = true;
 			InitializeSpine(GetWorld());
@@ -1113,19 +1115,26 @@ UE5Coro::TCoroutine<> UCartographGameInstanceModule::StreamingGather(FForceLaten
 		MaxHeight = MaxZ;
 	}
 
-	// Apply the current slider range to the compositor and first-paint everything.
+	// Apply the current slider range to the compositor (marks dirty for the new Z range).
 	OnZFilterUpdated(MinCached, MaxCached);
 
 	CARTO_LOG("StreamingGather Finished. Live: %d", BuildingStore.Num());
 
 	IsInitializing = false;
 
-	// NOTE: we deliberately do NOT redraw on join anymore. The compositor paints ONLY
-	// while the VANILLA game map is open (Compositor.SetMapOpen, wired from
-	// OnVanillaMapMenuShown - the SML Hook_MapMenu_Cartograph hook on Widget_MapContainer_C).
-	// Marking the whole atlas dirty here and draining it while the map is CLOSED - as
-	// ~18k buildings stream in on a megabase - is what OOM-killed the client. The first
-	// map-open issues SetFullRedraw and paints the converged state once.
+	// First-paint on join, like the ORIGINAL mod (which redrew on data-change and on the
+	// gather-finished path). SetFullRedraw marks every populated tile dirty; the
+	// never-cancelled compositor does NOT draw it immediately - it DEBOUNCES on the
+	// TileManager dirty epoch and only drains once the stream-in has settled
+	// (r.Cartograph.DrainDebounceTicks), so the converged atlas is painted ONCE in O(N).
+	// We do NOT gate on the map being open: the v2.0.3/4 OnVanillaMapMenuShown
+	// (Hook_MapMenu_Cartograph) hook NEVER fires on this SDK, so the gate never opened and
+	// the atlas was never painted. The debounce is what prevents the O(N^2) churn/OOM, not
+	// a map-open gate.
+	if (!bIsDedicatedServer)
+	{
+		Compositor.SetFullRedraw();
+	}
 }
 
 
@@ -1429,10 +1438,10 @@ void UCartographGameInstanceModule::OnCartographMenuButtonClicked(UUserWidget* W
 		}
 	}
 
-	// NOTE: the compositor drain is gated on the VANILLA game map being open, not on
-	// this Cartograph filters submenu button. The map-open/close wiring lives in
-	// OnVanillaMapMenuShown / OnVanillaMapMenuHidden (the SML Hook_MapMenu_Cartograph
-	// hook on Widget_MapContainer_C). This handler only toggles the filters submenu.
+	// NOTE: the compositor drain is NOT gated on any map-open signal. It renders on
+	// data-change (build hooks -> MarkDirtyForBox) and on join (SetFullRedraw), debounced
+	// on the TileManager dirty epoch so a megabase stream-in paints once in O(N). This
+	// handler only toggles the Cartograph filters submenu visibility.
 
 	if (IsOpen)
 	{
@@ -1473,8 +1482,15 @@ TArray<FString> UCartographGameInstanceModule::GetLayerCategoryOptions() const
 }
 
 
-void UCartographGameInstanceModule::OnVanillaMapMenuShown(const UUserWidget* Widget)
+void UCartographGameInstanceModule::OnVanillaMapMenuShown(const UUserWidget* Widget) const
 {
+	// Fired by the SML Hook_MapMenu_Cartograph hook (Widget_MapContainer_C) when the
+	// vanilla map opens. This BP asset binds to this UFUNCTION BY NAME, so the function
+	// MUST exist or the asset fails to cook - even though, on the current SDK, the hook
+	// does not actually fire at runtime. It does ONLY the original UI bookkeeping (start
+	// the Cartograph filters submenu collapsed); it deliberately does NOT drive the
+	// compositor. Rendering is data-driven + debounced in the compositor itself, NOT
+	// gated on map-open (that gate never worked - see TickConverge).
 	UWidget* Menu = Widget->WidgetTree->FindWidget("CartographMenu");
 	CARTO_LOG_ERROR_RETURN_IF_NULL(Menu);
 	Menu->SetVisibility(ESlateVisibility::Collapsed);
@@ -1488,33 +1504,9 @@ void UCartographGameInstanceModule::OnVanillaMapMenuShown(const UUserWidget* Wid
 
 	FOutputDeviceNull Ar;
 	Button->CallFunctionByNameWithArguments(TEXT("SetShowHideText"), Ar, nullptr, true);
-
-	// THE REAL MAP-OPEN SIGNAL. This is fired by the SML Hook_MapMenu_Cartograph hook
-	// (InsertionHook / AfterTarget on Widget_MapContainer_C's function entry) when the
-	// vanilla game map actually opens - which is exactly when the atlas must be on
-	// screen. Enable the compositor drain and mark the whole atlas dirty so the
-	// just-enabled, AoI-prioritized, per-frame-budgeted drain paints the current world
-	// state once and converges. The cost is paid on-open (map visible), NOT during the
-	// ~18k-building join stream with the map closed (the megabase OOM).
-	if (!bIsDedicatedServer)
-	{
-		CARTO_LOG("Vanilla map opened -> enabling compositor drain + full redraw");
-		Compositor.SetMapOpen(true);
-		Compositor.SetFullRedraw();
-	}
 }
 
 
-void UCartographGameInstanceModule::OnVanillaMapMenuHidden(const UUserWidget* Widget)
-{
-	// Map closed: pause the drain. Dirty tiles still accumulate (coalesced in the
-	// bitset) while closed and are repainted on the next open via SetFullRedraw, so
-	// closing while a drain is mid-flight is safe and bounds idle GPU work to zero.
-	if (!bIsDedicatedServer)
-	{
-		Compositor.SetMapOpen(false);
-	}
-}
 #pragma endregion
 
 

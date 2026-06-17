@@ -96,6 +96,7 @@ void FCartographTileManager::Initialize()
 
 	DirtyCount = 0;
 	PopCursor = 0;
+	DirtyEpoch = 0;
 	bHasAoI = false;
 	AoIBox = FBox2f(ForceInit);
 
@@ -151,6 +152,10 @@ void FCartographTileManager::MarkAllDirty()
 	// so restart the linear cursor; the AoI pass in PopDirtyTiles handles the
 	// visible tiles ahead of the linear drain regardless of where the cursor is.
 	PopCursor = 0;
+	// MarkAllDirty sets bits directly (not via MarkDirtyInternal), so bump the epoch here
+	// too. SetFullRedraw -> MarkAllDirty on join must register as a change so the debounce
+	// re-arms and the converged state is drained once the join settles.
+	++DirtyEpoch;
 }
 
 
@@ -244,6 +249,12 @@ int32 FCartographTileManager::DirtyNum() const
 bool FCartographTileManager::HasDirty() const
 {
 	return DirtyCount > 0;
+}
+
+
+uint64 FCartographTileManager::GetDirtyEpoch() const
+{
+	return DirtyEpoch;
 }
 
 
@@ -360,5 +371,10 @@ void FCartographTileManager::MarkDirtyInternal(FTileId Tile)
 	{
 		DirtyTiles[Tile] = true;
 		++DirtyCount;
+		// Advance the dirty epoch on every NEW dirty tile. This is the single write choke
+		// point for the bitset, so every MarkDirtyForBox during the ~18k-building stream-in
+		// bumps it; the compositor debounces its drain on this being stable for N ticks (the
+		// stream settled) - keeping the megabase first-paint O(N), not O(N^2).
+		++DirtyEpoch;
 	}
 }
