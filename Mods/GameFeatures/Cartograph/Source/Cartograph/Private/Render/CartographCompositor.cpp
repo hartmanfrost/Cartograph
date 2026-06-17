@@ -74,7 +74,6 @@ void FCartographCompositor::Initialize(
 	LastObservedEpoch = 0;
 	StableTicks = 0;
 	TicksSinceDirty = 0;
-	bDraining = false;
 
 	if (!IsReady())
 	{
@@ -298,60 +297,60 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 		// ---------------------------------------------------------------------
 		if (!(TileManager && TileManager->HasDirty()))
 		{
-			// Quiescent: nothing dirty. Reset the debounce counters + the drain latch and
-			// idle one tick so the loop never hot-spins the game thread.
+			// Quiescent: nothing dirty. Reset the debounce counters and idle one tick so the
+			// loop never hot-spins the game thread.
 			StableTicks = 0;
 			TicksSinceDirty = 0;
-			bDraining = false;
 			LastObservedEpoch = TileManager ? TileManager->GetDirtyEpoch() : LastObservedEpoch;
 			co_await Latent::NextTick();
 			continue;
 		}
 
-		// If we are NOT already mid-drain, run the debounce gate. Once a burst commits to
-		// draining (bDraining latched below), skip the gate and keep popping every tick
-		// until the dirty set empties, so a large set converges at K tiles/frame instead
-		// of re-waiting DrainDebounceTicks after every pop.
-		if (!bDraining)
+		// Advance the max-wait timer and the settle counter. StableTicks resets to 0 whenever
+		// the dirty EPOCH changes (a build hook / streamed building marked a tile), so during
+		// the ~1 min join stream-in it never reaches DebounceTicks and we render NOTHING; once
+		// the stream goes quiet it climbs and we drain.
+		++TicksSinceDirty;
+		const uint64 Epoch = TileManager->GetDirtyEpoch();
+		if (Epoch != LastObservedEpoch)
 		{
-			// Something is dirty. Advance the max-wait timer and update the settle counter.
-			++TicksSinceDirty;
-
-			const uint64 Epoch = TileManager->GetDirtyEpoch();
-			if (Epoch != LastObservedEpoch)
-			{
-				// The dirty set changed this tick (a build hook / streamed building marked
-				// a new tile): the burst is still in flight, restart the settle window.
-				LastObservedEpoch = Epoch;
-				StableTicks = 0;
-			}
-			else
-			{
-				++StableTicks;
-			}
-
-			const int32 DebounceTicks = FMath::Max(0, CVarCartographDrainDebounceTicks.GetValueOnGameThread());
-			const int32 MaxWaitTicks = FMath::Max(1, CVarCartographDrainMaxWaitTicks.GetValueOnGameThread());
-
-			// Drain only when the dirty set has SETTLED (stable for DebounceTicks) OR the
-			// max-wait fallback has elapsed (constant change). Otherwise idle one tick and
-			// keep waiting - dirty tiles stay coalesced in the bitset, painted once below.
-			const bool bSettled = StableTicks >= DebounceTicks;
-			const bool bMaxWaitElapsed = TicksSinceDirty >= MaxWaitTicks;
-			if (!bSettled && !bMaxWaitElapsed)
-			{
-				co_await Latent::NextTick();
-				continue;
-			}
-
-			// Commit to draining this settled (or max-wait-forced) burst. Latch bDraining
-			// so subsequent ticks keep popping without re-arming the debounce, and reset
-			// the timers so the NEXT burst (after this drain completes) debounces afresh.
-			bDraining = true;
+			LastObservedEpoch = Epoch;
 			StableTicks = 0;
-			TicksSinceDirty = 0;
-			// Diagnostic: confirms (in the runtime log) that the atlas paint actually fired
-			// after the dirty set settled - the signal that was MISSING in v2.0.3/2.0.4.
+		}
+		else
+		{
+			++StableTicks;
+		}
+
+		const int32 DebounceTicks = FMath::Max(0, CVarCartographDrainDebounceTicks.GetValueOnGameThread());
+		const int32 MaxWaitTicks = FMath::Max(1, CVarCartographDrainMaxWaitTicks.GetValueOnGameThread());
+		const bool bSettled = StableTicks >= DebounceTicks;
+		const bool bMaxWaitElapsed = TicksSinceDirty >= MaxWaitTicks;
+
+		// CRITICAL: re-check the settle EVERY iteration - there is NO drain latch. Each pass
+		// below pops just ONE K-tile batch, then the loop returns here. So a building that
+		// streams in mid-drain bumps the epoch, resets StableTicks, and PAUSES the drain until
+		// the stream re-settles. The previous version LATCHED a "draining" flag and kept
+		// popping every tick regardless of new dirties - on the megabase that rendered
+		// CONTINUOUSLY for ~40s through the ongoing post-gather stream and OOM-killed the
+		// client (render-thread command queue grew to ~17 GB). Pausing on new dirties keeps
+		// the paint a single bounded O(N) pass that only runs after the stream has stopped.
+		if (!bSettled && !bMaxWaitElapsed)
+		{
+			co_await Latent::NextTick();
+			continue;
+		}
+
+		// Settled (or max-wait): drain ONE K-tile batch below, then loop back to the gate.
+		// Reset ONLY the max-wait timer (it measures ticks since the last drain). Do NOT reset
+		// StableTicks: while the epoch stays stable it must remain >= DebounceTicks so
+		// successive iterations keep draining K tiles each until the set empties (fast
+		// convergence once settled); a new dirty resets it and pauses the drain.
+		TicksSinceDirty = 0;
+		// Log once, on the settle->drain transition (the exact tick the window closes), not
+		// every K-batch. Confirms in the runtime log that the atlas paint actually fired.
+		if (StableTicks == DebounceTicks || bMaxWaitElapsed)
+		{
 			CARTO_LOG("Compositor drain starting (dirty set settled%s)", bMaxWaitElapsed ? TEXT(", max-wait forced") : TEXT(""));
 		}
 

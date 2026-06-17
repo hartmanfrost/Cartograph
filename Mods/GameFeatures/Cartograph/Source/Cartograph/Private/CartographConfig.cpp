@@ -62,15 +62,16 @@ TAutoConsoleVariable<bool> CVarCartographRenderEnabled(
 
 TAutoConsoleVariable<int32> CVarCartographDrainDebounceTicks(
 	TEXT("r.Cartograph.DrainDebounceTicks"),
-	30,
-	TEXT("Settle window (in game-thread ticks) the never-cancelled compositor waits before\n")
-	TEXT("it drains the dirty-tile set. While buildings STREAM in on join (~18k on a megabase),\n")
-	TEXT("every MarkDirtyForBox advances the TileManager dirty EPOCH; the compositor only starts\n")
-	TEXT("draining once the epoch has been UNCHANGED for this many consecutive ticks (the stream\n")
-	TEXT("has settled). This is the rework's debounce-via-epoch analogue of the original mod's\n")
-	TEXT("debounce-via-cancel (RedrawMap cancels the in-progress redraw on each change), and is\n")
-	TEXT("what keeps first-paint O(N) instead of O(N^2): a dense tile re-dirtied by hundreds of\n")
-	TEXT("streamed buildings is rendered ONCE after settling, not once per streamed building.\n")
+	180,
+	TEXT("Settle window (in game-thread ticks, ~3 s at 60 fps) the never-cancelled compositor\n")
+	TEXT("waits before it drains the dirty-tile set. While buildings STREAM in on join (~18k on a\n")
+	TEXT("megabase), every MarkDirtyForBox advances the TileManager dirty EPOCH; the compositor only\n")
+	TEXT("starts draining once the epoch has been UNCHANGED for this many consecutive ticks (the\n")
+	TEXT("stream has settled). Set comfortably ABOVE the gaps WITHIN a bursty join stream so a brief\n")
+	TEXT("mid-stream lull does not start a drain that would then keep re-rendering tiles the rest of\n")
+	TEXT("the stream re-dirties. Even if it does start early, the loop pauses the drain on the next\n")
+	TEXT("streamed building (no latch), so it can never run continuously. This keeps first-paint O(N):\n")
+	TEXT("a dense tile re-dirtied by hundreds of streamed buildings is rendered ONCE after settling.\n")
 	TEXT("Clamped >= 0 (0 = drain immediately, no debounce)."),
 	ECVF_Default);
 

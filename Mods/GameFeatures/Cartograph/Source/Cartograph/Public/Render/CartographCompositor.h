@@ -196,17 +196,13 @@ private:
 	 *  reaches DrainDebounceTicks. Reset to 0 whenever the epoch advances. */
 	int32 StableTicks = 0;
 
-	/** Ticks elapsed since the dirty set first became non-empty without a drain. The
-	 *  max-wait fallback forces a drain once this reaches DrainMaxWaitTicks so constant
-	 *  change never starves the map. Reset to 0 on every drain and while quiescent. */
+	/** Ticks elapsed since the last drain (reset to 0 on every drain and while quiescent).
+	 *  The max-wait fallback forces a (still bounded, one-K-batch) drain once this reaches
+	 *  DrainMaxWaitTicks so constant change never starves the map. NOTE: there is
+	 *  deliberately NO "draining" latch - every TickConverge iteration re-checks the settle,
+	 *  so a building streaming in mid-drain pauses it. A latch ran a continuous render
+	 *  through the join stream and OOM-killed the client. */
 	int32 TicksSinceDirty = 0;
-
-	/** True once a settled (or max-wait-forced) burst has begun draining: keeps the loop
-	 *  popping K tiles every tick until the dirty set empties, WITHOUT re-arming the
-	 *  debounce between PopDirtyTiles passes. Without this latch a large dirty set would
-	 *  re-wait DrainDebounceTicks after every K-tile pop, so convergence would crawl.
-	 *  Cleared when the dirty set is fully drained (back to the debounce gate). */
-	bool bDraining = false;
 
 	// -------------------------------------------------------------------------
 	// Scissor mechanism state (SPEC 4.2: reuse the CartographCanvasRenderItem
