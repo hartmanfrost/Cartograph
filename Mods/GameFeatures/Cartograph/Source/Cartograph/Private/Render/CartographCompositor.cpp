@@ -378,17 +378,20 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 
 		const bool bRenderEnabled = CVarCartographRenderEnabled.GetValueOnGameThread();
 
-		// THE GPU/TDR BOUND. EndDrawCanvasToRenderTarget only ENQUEUES an RDG pass, and
-		// the RHI coalesces a frame's passes into ONE GPU submit - so a per-tile (or even
-		// per-chunk) Begin/EndDraw is NOT a separate submit; the FRAME BOUNDARY is. We
-		// therefore cap the building drawables emitted per FRAME and co_await a whole
-		// frame (NextTick) once the cap is hit, so the render thread flushes and the GPU
-		// drains before the next submit. Combined with the per-tile scissor (which clamps
-		// every drawable's fill to one 256px tile), per-frame GPU fill stays
-		// <= budget * tile_area - far under the Steam Deck's ~2-5s GPU TDR window even at
-		// low clocks, no matter how many thousands of buildings pack a single tile. This
-		// replaces the old per-tile FTickTimeBudget, which metered game-thread EMIT cycles
-		// (not GPU execution) and so could not bound a dense tile's submit.
+		// THE GPU/TDR + MEMORY BOUND. EndDrawCanvasToRenderTarget only ENQUEUES an RDG pass,
+		// and the RHI coalesces a frame's passes into ONE GPU submit - so a per-tile (or even
+		// per-chunk) Begin/EndDraw is NOT a separate submit; the FRAME BOUNDARY is. We therefore
+		// cap the building drawables emitted per FRAME and co_await FlushDrainFrame once the cap
+		// is hit. That does two things: (1) GPU/TDR - it yields a whole frame so the render thread
+		// flushes and the GPU drains before the next submit; combined with the per-tile scissor
+		// (which clamps every drawable's fill to one 256px tile), per-frame GPU fill stays
+		// <= budget * tile_area, far under the Steam Deck's ~2-5s TDR window no matter how many
+		// thousands of buildings pack a tile; (2) MEMORY - it FENCES the render thread, so the
+		// game thread cannot enqueue the next frame's passes before the slow Deck GPU has retired
+		// the last. Without that fence the bare per-frame cap still OOM-killed the client on a
+		// megabase: the passes (each holding a large 4096px-atlas transient) piled up to ~16 GB.
+		// This replaces the old per-tile FTickTimeBudget, which metered game-thread EMIT cycles
+		// (not GPU execution) and so could bound neither a dense tile's submit nor the backlog.
 		int32 FrameBudget = FMath::Max(1, CVarCartographMaxDrawablesPerFrame.GetValueOnGameThread());
 
 		// K still caps how many WHOLE tiles we START per drain pass; PopDirtyTiles orders
@@ -441,31 +444,67 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 					Offset = Num;
 				}
 
-				// Per-frame budget spent with this tile unfinished: yield a full frame
-				// (forces the submit boundary), then refill for the next frame.
+				// Per-frame budget spent with this tile unfinished: yield until the render
+				// thread has retired this frame's canvas passes (back-pressure, see
+				// FlushDrainFrame - this is the OOM fix), then refill for the next frame.
 				if (FrameBudget <= 0 && Offset < Num)
 				{
-					co_await Latent::NextTick();
+					co_await FlushDrainFrame(Context);
 					FrameBudget = FMath::Max(1, CVarCartographMaxDrawablesPerFrame.GetValueOnGameThread());
 				}
 			}
 			while (Offset < Num);
 
-			// Budget spent exactly at a tile boundary: yield before the next tile so the
-			// per-frame bound also holds ACROSS tiles (sparse tiles batch up to the cap).
+			// Budget spent exactly at a tile boundary: yield (fenced) before the next tile so
+			// the per-frame bound also holds ACROSS tiles (sparse tiles batch up to the cap).
 			if (FrameBudget <= 0)
 			{
-				co_await Latent::NextTick();
+				co_await FlushDrainFrame(Context);
 				FrameBudget = FMath::Max(1, CVarCartographMaxDrawablesPerFrame.GetValueOnGameThread());
 			}
 		}
 
 		// Always yield once per drain pass so the loop can never hot-spin even when every
-		// popped tile was empty (all clear-only, zero budget consumed).
-		co_await Latent::NextTick();
+		// popped tile was empty. This pass still emitted at least one clear-only canvas pass
+		// per popped tile, so fence here too: every GPU touch the drain makes is back-pressured,
+		// never just the budget-boundary ones (a pass of sparse tiles under the cap would
+		// otherwise enqueue unfenced and could still pile up).
+		co_await FlushDrainFrame(Context);
 	}
 
 	CARTO_LOG_DEBUG("Compositor TickConverge exited cleanly (Shutdown)");
+	co_return;
+}
+
+
+// -----------------------------------------------------------------------------
+// Render-thread back-pressure (the OOM fix). See the header contract for the full
+// rationale. In short: the drain enqueues Begin/EndDrawCanvasToRenderTarget passes on
+// the 4096px atlas, each holding a large transient alive until the render thread + GPU
+// retire it. The per-frame drawable cap does NOT bound this - the game thread outruns
+// the slow Deck GPU, so a megabase first-paint piled passes up to ~16 GB and was
+// OOM-killed (no GPU TDR; pure host-memory growth with a 13->1 fps swap-thrash spiral).
+// Fencing after each drain frame and yielding ticks until it signals caps in-flight
+// compositor GPU work to ONE frame's batch: memory stays flat and the paint self-paces
+// to the GPU's true rate, while the game thread keeps ticking (unlike a hard
+// FlushRenderingCommands) so the rest of the game stays responsive during the paint.
+// -----------------------------------------------------------------------------
+UE5Coro::TCoroutine<> FCartographCompositor::FlushDrainFrame(UE5Coro::TLatentContext<> Context)
+{
+	using namespace UE5Coro;
+
+	FRenderCommandFence Fence;
+	Fence.BeginFence();
+
+	// Yield at least one full frame (the submit boundary), then keep yielding until the
+	// render thread has actually drained what we enqueued. Bail on Shutdown so the
+	// never-cancelled loop can still exit promptly.
+	do
+	{
+		co_await Latent::NextTick();
+	}
+	while (bRunning && !Fence.IsFenceComplete());
+
 	co_return;
 }
 

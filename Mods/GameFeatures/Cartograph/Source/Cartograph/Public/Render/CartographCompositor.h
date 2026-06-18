@@ -278,6 +278,22 @@ private:
 	void DrawGeometry(UCanvas* Canvas, const struct FDrawGeometry& Geometry);
 
 	/**
+	 * Render-thread back-pressure for the drain loop. Yields game-thread ticks until an
+	 * FRenderCommandFence signals the render thread has retired everything the drain
+	 * enqueued this frame, so in-flight compositor GPU work (and the large per-pass
+	 * canvas transients on the 4096px atlas) is capped at a SINGLE frame's batch.
+	 *
+	 * The per-frame drawable cap alone does NOT bound memory: the game thread keeps
+	 * enqueuing the next frame's Begin/EndDrawCanvasToRenderTarget passes while the slow
+	 * Steam Deck GPU is still draining the last, so over a ~150-frame megabase first-paint
+	 * the passes pile up and the process grew to ~16 GB and was OOM-killed (observed:
+	 * GameThread total-vm 16.4 GB, framerate spiralling 13->1 fps into a freeze, no GPU
+	 * TDR). Fencing flattens memory and self-paces the paint to the GPU's true rate;
+	 * yielding (vs FlushRenderingCommands' hard block) keeps the game responsive meanwhile.
+	 */
+	UE5Coro::TCoroutine<> FlushDrainFrame(UE5Coro::TLatentContext<> Context);
+
+	/**
 	 * COMMITTED Phase-A FALLBACK (SPEC Q3, §4.2): if the persistent target does
 	 * NOT preserve its contents across the 2nd+ BeginDrawCanvasToRenderTarget on
 	 * the CSS fork (the "lines going crazy" implicit-re-clear branch history),

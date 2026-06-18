@@ -24,9 +24,14 @@ TAutoConsoleVariable<float> CVarCartographFrameBudgetFraction(
 
 TAutoConsoleVariable<int32> CVarCartographTilesPerFrame(
 	TEXT("r.Cartograph.TilesPerFrame"),
-	8,
-	TEXT("Hard cap K on dirty tiles popped and rendered per compositor tick.\n")
-	TEXT("The budget fraction is the soft limit; K bounds a single frame's drain."),
+	2,
+	TEXT("Hard cap K on dirty tiles popped per compositor drain pass.\n")
+	TEXT("Each pass renders <= K tiles (sharing the MaxDrawablesPerFrame budget) then loops\n")
+	TEXT("back to the settle gate, so a smaller K re-checks for new dirties more often (a\n")
+	TEXT("building streaming in mid-drain pauses the paint sooner) and keeps the work between\n")
+	TEXT("render-thread fences small. Lowered from 8 -> 2 with the FlushDrainFrame back-pressure:\n")
+	TEXT("each fenced batch is now a couple of Begin/EndDraw passes, not up to eight, so the\n")
+	TEXT("game stays responsive during a megabase first-paint."),
 	ECVF_Default);
 
 TAutoConsoleVariable<bool> CVarCartographPersistSpatialCache(
@@ -38,16 +43,20 @@ TAutoConsoleVariable<bool> CVarCartographPersistSpatialCache(
 
 TAutoConsoleVariable<int32> CVarCartographMaxDrawablesPerFrame(
 	TEXT("r.Cartograph.MaxDrawablesPerFrame"),
-	128,
+	64,
 	TEXT("Hard cap on building drawables emitted into the atlas per compositor frame.\n")
-	TEXT("The drain loop co_awaits a FULL frame (NextTick) once this many drawables have\n")
-	TEXT("been emitted, so a dense tile is painted progressively over several frames.\n")
-	TEXT("This is the real GPU/TDR bound: EndDrawCanvasToRenderTarget only ENQUEUES an RDG\n")
-	TEXT("pass (the RHI coalesces a frame's passes into one submit), so the FRAME BOUNDARY -\n")
-	TEXT("not the per-tile Begin/EndDraw - is what bounds a single GPU submit. With the\n")
-	TEXT("per-tile scissor clamping each drawable's fill to one 256px tile, per-frame fill is\n")
-	TEXT("<= cap * tile_area, far under the Steam Deck's ~2-5s TDR window even at low clocks.\n")
-	TEXT("Lower it if the Deck stutters; raise it to converge faster. Clamped >= 1."),
+	TEXT("Once this many drawables have been emitted the drain co_awaits FlushDrainFrame: it\n")
+	TEXT("yields a FULL frame AND fences the render thread, so a dense tile paints progressively\n")
+	TEXT("over several frames with at most one frame's batch in flight on the GPU at a time.\n")
+	TEXT("Two bounds in one: (1) GPU/TDR - EndDrawCanvasToRenderTarget only ENQUEUES an RDG pass\n")
+	TEXT("(the RHI coalesces a frame's passes into one submit), so the FRAME BOUNDARY bounds a\n")
+	TEXT("single submit, and the per-tile scissor clamps each drawable's fill to one 256px tile,\n")
+	TEXT("keeping per-frame fill <= cap * tile_area, far under the Deck's ~2-5s TDR window;\n")
+	TEXT("(2) MEMORY - the fence in FlushDrainFrame stops the game thread enqueuing the next\n")
+	TEXT("frame's passes before the slow Deck GPU has retired the last, which is what otherwise\n")
+	TEXT("grew the process to ~16 GB and got it OOM-killed mid-paint. Lowered 128 -> 64 so each\n")
+	TEXT("fenced batch is smaller and the game stays responsive. Lower if the Deck stutters;\n")
+	TEXT("raise to converge faster (memory stays bounded either way). Clamped >= 1."),
 	ECVF_Default);
 
 TAutoConsoleVariable<bool> CVarCartographRenderEnabled(
