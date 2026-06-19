@@ -191,6 +191,29 @@ extern TAutoConsoleVariable<int32> CVarCartographDrainDebounceTicks;
  */
 extern TAutoConsoleVariable<int32> CVarCartographDrainMaxWaitTicks;
 
+/**
+ * r.Cartograph.MaxBeginDrawsPerDrain (int, default 64). DIAGNOSTIC SAFETY CAP.
+ * Hard ceiling on the number of BeginDrawCanvasToRenderTarget calls issued in a single
+ * drain session. Once reached, the rest of the session's tiles are still popped + gathered
+ * + consumed (the dirty set drains identically) but the actual canvas draw is SKIPPED, so
+ * host/GPU memory cannot run away to the ~16 GB OOM seen on the megabase. This is BOTH a
+ * crash guard AND the canvas-vs-gather discriminator: with the DRAINMEM log, if used memory
+ * RISES up to the cap and then FLATTENS across the no-draw tail, the growth is in the
+ * BeginDraw/canvas path; if it keeps climbing through the no-draw tail, it is in the
+ * gather/store/net path. 0 = uncapped (the old behavior; will OOM on a megabase). Clamped >= 0.
+ */
+extern TAutoConsoleVariable<int32> CVarCartographMaxBeginDrawsPerDrain;
+
+/**
+ * r.Cartograph.FlushAfterNDraws (int, default 0 = off). DIAGNOSTIC RECLAIM PROBE.
+ * When > 0, call FlushRenderingCommands() after every N BeginDraw calls during a drain, to
+ * force the render thread + RHI to flush and run deferred-deletion. If the per-open growth is
+ * merely RECLAIM LAG (resources pending deletion), this bounds it; if it is a true per-bind
+ * driver/pool leak, it will NOT help (proving leak vs lag). Off by default so the baseline
+ * DRAINMEM curve is unconfounded; flip via INI to test the reclaim hypothesis. Clamped >= 0.
+ */
+extern TAutoConsoleVariable<int32> CVarCartographFlushAfterNDraws;
+
 
 // -----------------------------------------------------------------------------
 // Convenience accessors (inline, header-safe).

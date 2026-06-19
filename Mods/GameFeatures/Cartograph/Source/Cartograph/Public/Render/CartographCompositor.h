@@ -211,6 +211,24 @@ private:
 	int32 DirtyHighWater = 0;
 
 	// -------------------------------------------------------------------------
+	// DIAGNOSTIC instrumentation (self-pins the megabase OOM). Counters reset + a
+	// memory baseline captured at each drain-session start; LogDrainMemory logs the
+	// FPlatformMemory used-physical/virtual deltas + live UObject count against the
+	// running BeginDraw/tile counts. With r.Cartograph.MaxBeginDrawsPerDrain capping
+	// the draws, the no-draw tail of the curve discriminates the canvas path (memory
+	// flattens once draws stop) from the gather/store/net path (keeps climbing).
+	// -------------------------------------------------------------------------
+	/** BeginDrawCanvasToRenderTarget calls issued this drain session (the safety cap counts these). */
+	int32 InstrBeginDrawCount = 0;
+	/** Tiles popped + processed this drain session (keeps climbing through the no-draw tail). */
+	int32 InstrTilesDrawn = 0;
+	/** EmitTileChunk invocations that actually drew this drain session. */
+	int32 InstrChunksEmitted = 0;
+	/** FPlatformMemory used-physical / used-virtual captured at drain-session start (delta baseline). */
+	uint64 InstrBaselinePhysical = 0;
+	uint64 InstrBaselineVirtual = 0;
+
+	// -------------------------------------------------------------------------
 	// Scissor mechanism state (SPEC 4.2: reuse the CartographCanvasRenderItem
 	// ScissorArea path). Public-by-friend so the global FCanvas::GetBatchedElements
 	// hook can read it the same way the legacy FCartographCanvasRenderItem reads
@@ -292,6 +310,11 @@ private:
 	 * yielding (vs FlushRenderingCommands' hard block) keeps the game responsive meanwhile.
 	 */
 	UE5Coro::TCoroutine<> FlushDrainFrame(UE5Coro::TLatentContext<> Context);
+
+	/** Log a DRAINMEM line: process used-physical/virtual (+ delta since drain start), live
+	 *  UObject count, and the running BeginDraw/tile/chunk counters. Phase is a TEXT() literal
+	 *  ("start"/"tick") identifying the sample point. Cheap; called at drain start + every 16 tiles. */
+	void LogDrainMemory(const TCHAR* Phase);
 
 	/**
 	 * COMMITTED Phase-A FALLBACK (SPEC Q3, §4.2): if the persistent target does

@@ -84,6 +84,28 @@ TAutoConsoleVariable<int32> CVarCartographDrainDebounceTicks(
 	TEXT("Clamped >= 0 (0 = drain immediately, no debounce)."),
 	ECVF_Default);
 
+TAutoConsoleVariable<int32> CVarCartographMaxBeginDrawsPerDrain(
+	TEXT("r.Cartograph.MaxBeginDrawsPerDrain"),
+	64,
+	TEXT("DIAGNOSTIC SAFETY CAP. Max BeginDrawCanvasToRenderTarget calls per drain session.\n")
+	TEXT("Once hit, remaining tiles are still popped/gathered/consumed (the dirty set drains\n")
+	TEXT("identically) but the canvas draw is SKIPPED, so memory cannot run away to the ~16 GB\n")
+	TEXT("megabase OOM. Doubles as the canvas-vs-gather discriminator: with the DRAINMEM log, if\n")
+	TEXT("used memory rises to the cap then FLATTENS across the no-draw tail -> the BeginDraw/canvas\n")
+	TEXT("path is the leak; if it keeps climbing through the tail -> gather/store/net is. 0 = uncapped\n")
+	TEXT("(old behavior, OOMs on a megabase). Clamped >= 0."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarCartographFlushAfterNDraws(
+	TEXT("r.Cartograph.FlushAfterNDraws"),
+	0,
+	TEXT("DIAGNOSTIC RECLAIM PROBE. When > 0, FlushRenderingCommands() after every N BeginDraw calls\n")
+	TEXT("to force the render thread + RHI deferred-deletion to run. If the per-open growth is merely\n")
+	TEXT("reclaim LAG it gets bounded; if it is a true per-bind driver/pool leak it will NOT help\n")
+	TEXT("(distinguishes leak vs lag). Off by default so the baseline DRAINMEM curve is unconfounded.\n")
+	TEXT("Clamped >= 0."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarCartographDrainMaxWaitTicks(
 	TEXT("r.Cartograph.DrainMaxWaitTicks"),
 	9000,

@@ -33,6 +33,11 @@
 #include "TextureResource.h"
 #include "ClearQuad.h"  // DrawClearQuad - SPIKE(Q3): confirm exported on the CSS RenderCore
 
+// DIAGNOSTIC instrumentation: process memory stats + live UObject count (LogDrainMemory).
+// Core/CoreUObject are already linked (Cartograph.Build.cs), so no Build.cs change.
+#include "HAL/PlatformMemory.h"
+#include "UObject/UObjectArray.h"
+
 // =============================================================================
 // CartographCompositor.cpp - Phase-A bounded tiled FCanvas (the TDR fix).
 // SPEC 4.2 Phase A + 4.3. See the header for the architectural contract.
@@ -373,7 +378,17 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 		// every K-batch. Confirms in the runtime log that the atlas paint actually fired.
 		if (StableTicks == DebounceTicks || bMaxWaitElapsed)
 		{
+			// DIAGNOSTIC: reset per-session counters + capture the memory baseline at the
+			// settle->drain transition (fires exactly once per drain session), so the DRAINMEM
+			// deltas measure growth across THIS paint, not since process start.
+			InstrBeginDrawCount = 0;
+			InstrTilesDrawn = 0;
+			InstrChunksEmitted = 0;
+			const FPlatformMemoryStats BaseMem = FPlatformMemory::GetStats();
+			InstrBaselinePhysical = BaseMem.UsedPhysical;
+			InstrBaselineVirtual = BaseMem.UsedVirtual;
 			CARTO_LOG("Compositor drain starting (dirty set settled%s)", bMaxWaitElapsed ? TEXT(", max-wait forced") : TEXT(""));
+			LogDrainMemory(TEXT("start"));
 		}
 
 		const bool bRenderEnabled = CVarCartographRenderEnabled.GetValueOnGameThread();
@@ -404,6 +419,16 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 			if (!bRunning)
 			{
 				break;
+			}
+
+			// DIAGNOSTIC: count every tile processed (keeps climbing through the no-draw tail) and
+			// sample memory every 16 tiles, so the per-tile growth slope + whether the safety cap's
+			// no-draw tail FLATTENS the curve (canvas leak) or not (gather leak) is captured even if
+			// the run later OOMs.
+			++InstrTilesDrawn;
+			if ((InstrTilesDrawn % 16) == 0)
+			{
+				LogDrainMemory(TEXT("tick"));
 			}
 
 			// Gather this tile's sorted drawables ONCE (pure CPU; opens no canvas). A
@@ -506,6 +531,33 @@ UE5Coro::TCoroutine<> FCartographCompositor::FlushDrainFrame(UE5Coro::TLatentCon
 	while (bRunning && !Fence.IsFenceComplete());
 
 	co_return;
+}
+
+
+// -----------------------------------------------------------------------------
+// DIAGNOSTIC: log a DRAINMEM sample. UsedVirt is the key metric - the megabase OOM is on
+// total-vm (committed, not resident), where D3D12/driver per-RT-bind shadow resources show
+// up; UsedPhys is the resident side. dPhys/dVirt are deltas since drain-session start, so the
+// growth-per-tile slope is read directly. Pairing the memory deltas with BeginDraw vs Tiles
+// pins WHAT grows: if dVirt tracks BeginDraw and flattens once the safety cap stops draws
+// (while Tiles keeps climbing), the canvas-draw path is the leak; if dVirt tracks Tiles
+// through the no-draw tail, gather/store is.
+// -----------------------------------------------------------------------------
+void FCartographCompositor::LogDrainMemory(const TCHAR* Phase)
+{
+	const FPlatformMemoryStats Mem = FPlatformMemory::GetStats();
+	const double ToMB = 1.0 / (1024.0 * 1024.0);
+	const double UsedPhysMB = (double)Mem.UsedPhysical * ToMB;
+	const double UsedVirtMB = (double)Mem.UsedVirtual * ToMB;
+	const double dPhysMB = ((double)Mem.UsedPhysical - (double)InstrBaselinePhysical) * ToMB;
+	const double dVirtMB = ((double)Mem.UsedVirtual - (double)InstrBaselineVirtual) * ToMB;
+	const int32 LiveUObjects = GUObjectArray.GetObjectArrayNumMinusAvailable();
+
+	CARTO_LOG("DRAINMEM %s | BeginDraw=%d Tiles=%d Chunks=%d | UsedPhys=%.0fMB UsedVirt=%.0fMB dPhys=%+.0fMB dVirt=%+.0fMB | UObjects=%d",
+		Phase,
+		InstrBeginDrawCount, InstrTilesDrawn, InstrChunksEmitted,
+		UsedPhysMB, UsedVirtMB, dPhysMB, dVirtMB,
+		LiveUObjects);
 }
 
 
@@ -698,6 +750,19 @@ void FCartographCompositor::EmitTileChunk(FTileId Tile, const TArray<FDrawable>&
 		return;
 	}
 
+	// DIAGNOSTIC SAFETY CAP + canvas/gather discriminator: once this drain session has issued
+	// r.Cartograph.MaxBeginDrawsPerDrain BeginDraw calls, stop DRAWING (the caller still advances
+	// Offset, so the tile is consumed and the dirty set drains identically) so memory cannot run
+	// away to the ~16 GB megabase OOM. The no-draw tail of the DRAINMEM curve then reveals whether
+	// the growth was in THIS canvas path (curve flattens once draws stop) or in gather/store/net
+	// (keeps climbing as tiles are still gathered).
+	const int32 MaxBeginDraws = CVarCartographMaxBeginDrawsPerDrain.GetValueOnGameThread();
+	if (MaxBeginDraws > 0 && InstrBeginDrawCount >= MaxBeginDraws)
+	{
+		return;
+	}
+	++InstrChunksEmitted;
+
 	// Publish the scissor BEFORE opening the canvas so the global hook clips every batch
 	// to the tile rect (and clamps per-drawable GPU fill to <= one tile).
 	SetTileScissor(Tile);
@@ -712,6 +777,9 @@ void FCartographCompositor::EmitTileChunk(FTileId Tile, const TArray<FDrawable>&
 		ScissorArea = { 0, 0, 0, 0 };
 		return;
 	}
+
+	// DIAGNOSTIC: count this BeginDraw (the safety cap + the DRAINMEM "BeginDraw=" metric key off it).
+	++InstrBeginDrawCount;
 
 	// CurrentCanvas lets the scissor hook recognise OUR canvas (it scissors only when
 	// Canvas == CurrentCanvas).
@@ -745,6 +813,16 @@ void FCartographCompositor::EmitTileChunk(FTileId Tile, const TArray<FDrawable>&
 	// EndDraw enqueues this chunk. The caller co_awaits a FRAME between chunks so the RHI
 	// closes the command buffer and the GPU drains before the next submit (the bound).
 	UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(World, Context);
+
+	// DIAGNOSTIC reclaim probe (off by default, N=0): force the render thread + RHI deferred-
+	// deletion to run every N draws, to test whether the per-open growth is reclaim LAG (this
+	// bounds it) vs a true per-bind driver/pool leak (this won't help). A hard sync, so only for
+	// the controlled INI-toggled experiment, never the default path.
+	const int32 FlushN = CVarCartographFlushAfterNDraws.GetValueOnGameThread();
+	if (FlushN > 0 && (InstrBeginDrawCount % FlushN) == 0)
+	{
+		FlushRenderingCommands();
+	}
 
 	CurrentCanvas = nullptr;
 	ScissorArea = { 0, 0, 0, 0 };
