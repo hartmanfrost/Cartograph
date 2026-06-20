@@ -84,10 +84,26 @@ TAutoConsoleVariable<int32> CVarCartographDrainDebounceTicks(
 	TEXT("Clamped >= 0 (0 = drain immediately, no debounce)."),
 	ECVF_Default);
 
+TAutoConsoleVariable<int32> CVarCartographMaxDrawablesPerDrain(
+	TEXT("r.Cartograph.MaxDrawablesPerDrain"),
+	6000,
+	TEXT("LEAK-CALIBRATED SAFETY CAP. Max building drawables EMITTED into the atlas per drain session.\n")
+	TEXT("The megabase OOM growth tracks drawables DRAWN (~0.86 MB each per the DRAINMEM logs), so capping\n")
+	TEXT("drawables bounds the worst case directly: 6000 * 0.86 MB ~= 5 GB over a ~3.9 GB baseline ~= 9 GB,\n")
+	TEXT("safely under the Deck's ~11.8 GB. Unlike a Begin/Draw-call cap, empty tiles (0 drawables) do not\n")
+	TEXT("burn the budget, so the dense base paints. Remaining tiles still drain (just not drawn). If the\n")
+	TEXT("GPU-synced fence holds the memory flat up to this cap, raise/remove it next build. 0 = uncapped.\n")
+	TEXT("Clamped >= 0."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarCartographMaxBeginDrawsPerDrain(
 	TEXT("r.Cartograph.MaxBeginDrawsPerDrain"),
-	64,
-	TEXT("DIAGNOSTIC SAFETY CAP. Max BeginDrawCanvasToRenderTarget calls per drain session.\n")
+	0,
+	TEXT("SECONDARY/LEGACY cap on BeginDrawCanvasToRenderTarget calls per drain (0 = OFF, the default now).\n")
+	TEXT("Superseded by r.Cartograph.MaxDrawablesPerDrain, which caps the actual leak axis (drawables) rather\n")
+	TEXT("than Begin/Draw calls that empty tiles inflate. Kept for manual diagnostics.\n")
+	TEXT("--- legacy notes ---\n")
+	TEXT("Max BeginDrawCanvasToRenderTarget calls per drain session.\n")
 	TEXT("Once hit, remaining tiles are still popped/gathered/consumed (the dirty set drains\n")
 	TEXT("identically) but the canvas draw is SKIPPED, so memory cannot run away to the ~16 GB\n")
 	TEXT("megabase OOM. Doubles as the canvas-vs-gather discriminator: with the DRAINMEM log, if\n")

@@ -384,6 +384,7 @@ UE5Coro::TCoroutine<> FCartographCompositor::TickConverge(UE5Coro::TLatentContex
 			InstrBeginDrawCount = 0;
 			InstrTilesDrawn = 0;
 			InstrChunksEmitted = 0;
+			InstrDrawablesEmitted = 0;
 			const FPlatformMemoryStats BaseMem = FPlatformMemory::GetStats();
 			InstrBaselinePhysical = BaseMem.UsedPhysical;
 			InstrBaselineVirtual = BaseMem.UsedVirtual;
@@ -518,8 +519,16 @@ UE5Coro::TCoroutine<> FCartographCompositor::FlushDrainFrame(UE5Coro::TLatentCon
 {
 	using namespace UE5Coro;
 
+	// ESyncDepth::RHIThread = the fence is enqueued to the RHI thread and signals only once all prior
+	// translation AND GPU submission is complete - NOT the default RenderThread depth. v2.0.8 used the
+	// render-thread-only fence: it bounded the render-COMMAND queue (framerate held) but NOT host memory,
+	// which still grew to ~16 GB on a megabase. The DRAINMEM instrumentation then showed the growth tracks
+	// DRAWABLES actually drawn (~0.86 MB each), concentrated on dense/high-fill tiles - i.e. the GPU falls
+	// behind on heavy tiles and its per-draw resources (freed only after RHI submission / GPU retirement)
+	// pile up, which a render-thread fence never waits for. Syncing to the RHI thread paces the drain to the
+	// GPU submission rate so those resources are reclaimed before the next batch is enqueued.
 	FRenderCommandFence Fence;
-	Fence.BeginFence();
+	Fence.BeginFence(FRenderCommandFence::ESyncDepth::RHIThread);
 
 	// Yield at least one full frame (the submit boundary), then keep yielding until the
 	// render thread has actually drained what we enqueued. Bail on Shutdown so the
@@ -553,9 +562,9 @@ void FCartographCompositor::LogDrainMemory(const TCHAR* Phase)
 	const double dVirtMB = ((double)Mem.UsedVirtual - (double)InstrBaselineVirtual) * ToMB;
 	const int32 LiveUObjects = GUObjectArray.GetObjectArrayNumMinusAvailable();
 
-	CARTO_LOG("DRAINMEM %s | BeginDraw=%d Tiles=%d Chunks=%d | UsedPhys=%.0fMB UsedVirt=%.0fMB dPhys=%+.0fMB dVirt=%+.0fMB | UObjects=%d",
+	CARTO_LOG("DRAINMEM %s | BeginDraw=%d Drawables=%d Tiles=%d Chunks=%d | UsedPhys=%.0fMB UsedVirt=%.0fMB dPhys=%+.0fMB dVirt=%+.0fMB | UObjects=%d",
 		Phase,
-		InstrBeginDrawCount, InstrTilesDrawn, InstrChunksEmitted,
+		InstrBeginDrawCount, InstrDrawablesEmitted, InstrTilesDrawn, InstrChunksEmitted,
 		UsedPhysMB, UsedVirtMB, dPhysMB, dVirtMB,
 		LiveUObjects);
 }
@@ -750,12 +759,19 @@ void FCartographCompositor::EmitTileChunk(FTileId Tile, const TArray<FDrawable>&
 		return;
 	}
 
-	// DIAGNOSTIC SAFETY CAP + canvas/gather discriminator: once this drain session has issued
-	// r.Cartograph.MaxBeginDrawsPerDrain BeginDraw calls, stop DRAWING (the caller still advances
-	// Offset, so the tile is consumed and the dirty set drains identically) so memory cannot run
-	// away to the ~16 GB megabase OOM. The no-draw tail of the DRAINMEM curve then reveals whether
-	// the growth was in THIS canvas path (curve flattens once draws stop) or in gather/store/net
-	// (keeps climbing as tiles are still gathered).
+	// LEAK-CALIBRATED SAFETY CAP (primary): the megabase OOM growth tracks DRAWABLES drawn (~0.86 MB each
+	// per the DRAINMEM logs), so once this drain has emitted r.Cartograph.MaxDrawablesPerDrain drawables we
+	// STOP drawing (the caller still advances Offset, so the tile is consumed and the dirty set drains) -
+	// bounding worst-case host growth to ~cap*0.86 MB regardless of how memory is reported under Proton. The
+	// GPU-synced fence (FlushDrainFrame) is the actual FIX attempt; this cap is the can't-OOM backstop while
+	// we confirm it holds (DRAINMEM dPhys/dVirt should stay flat up to the cap if the fence fixed it).
+	const int32 MaxDrawables = CVarCartographMaxDrawablesPerDrain.GetValueOnGameThread();
+	if (MaxDrawables > 0 && InstrDrawablesEmitted >= MaxDrawables)
+	{
+		return;
+	}
+	// Secondary/legacy BeginDraw-count cap (default OFF). Empty tiles inflate Begin/Draw counts without
+	// drawing, so this is a coarser bound than the drawable cap above; kept for manual diagnostics.
 	const int32 MaxBeginDraws = CVarCartographMaxBeginDrawsPerDrain.GetValueOnGameThread();
 	if (MaxBeginDraws > 0 && InstrBeginDrawCount >= MaxBeginDraws)
 	{
@@ -809,6 +825,8 @@ void FCartographCompositor::EmitTileChunk(FTileId Tile, const TArray<FDrawable>&
 	{
 		DrawGeometry(Canvas, Drawables[i].Geometry);
 	}
+	// Count the drawables actually emitted - the leak axis the MaxDrawablesPerDrain cap bounds.
+	InstrDrawablesEmitted += FMath::Max(0, EndIdx - StartIdx);
 
 	// EndDraw enqueues this chunk. The caller co_awaits a FRAME between chunks so the RHI
 	// closes the command buffer and the GPU drains before the next submit (the bound).

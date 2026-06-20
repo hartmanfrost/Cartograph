@@ -224,6 +224,10 @@ private:
 	int32 InstrTilesDrawn = 0;
 	/** EmitTileChunk invocations that actually drew this drain session. */
 	int32 InstrChunksEmitted = 0;
+	/** Building drawables actually emitted this drain session - the leak axis (~0.86 MB each on the Deck);
+	 *  r.Cartograph.MaxDrawablesPerDrain caps THIS to bound worst-case growth independently of how memory
+	 *  is reported under Proton. */
+	int32 InstrDrawablesEmitted = 0;
 	/** FPlatformMemory used-physical / used-virtual captured at drain-session start (delta baseline). */
 	uint64 InstrBaselinePhysical = 0;
 	uint64 InstrBaselineVirtual = 0;

@@ -205,6 +205,20 @@ extern TAutoConsoleVariable<int32> CVarCartographDrainMaxWaitTicks;
 extern TAutoConsoleVariable<int32> CVarCartographMaxBeginDrawsPerDrain;
 
 /**
+ * r.Cartograph.MaxDrawablesPerDrain (int, default 6000). LEAK-CALIBRATED SAFETY CAP.
+ * Hard ceiling on the TOTAL building drawables emitted into the atlas in one drain session. The megabase
+ * OOM growth tracks drawables DRAWN (~0.86 MB each from the DRAINMEM instrumentation: ~64 sparse draws -> 0
+ * growth, ~18.5k dense-base draws -> ~16 GB), so capping DRAWABLES (not Begin/Draw calls, which empty tiles
+ * inflate) bounds the worst-case growth directly and independently of how memory is reported under Proton:
+ * 6000 * 0.86 MB ~= 5 GB over a ~3.9 GB baseline ~= 9 GB, safely under the Deck's ~11.8 GB userspace. Once
+ * hit, remaining tiles are still popped/consumed (the dirty set drains) but not drawn. AoI ordering draws the
+ * player's area first, so the cap paints the base core, not edge tiles. If the GPU-synced fence fix holds
+ * (memory stays flat in DRAINMEM up to the cap) the cap can be raised/removed next build for the full map.
+ * 0 = uncapped. Clamped >= 0.
+ */
+extern TAutoConsoleVariable<int32> CVarCartographMaxDrawablesPerDrain;
+
+/**
  * r.Cartograph.FlushAfterNDraws (int, default 0 = off). DIAGNOSTIC RECLAIM PROBE.
  * When > 0, call FlushRenderingCommands() after every N BeginDraw calls during a drain, to
  * force the render thread + RHI to flush and run deferred-deletion. If the per-open growth is
