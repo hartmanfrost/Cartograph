@@ -231,6 +231,12 @@ private:
 	/** FPlatformMemory used-physical / used-virtual captured at drain-session start (delta baseline). */
 	uint64 InstrBaselinePhysical = 0;
 	uint64 InstrBaselineVirtual = 0;
+	/** Host-RAM + GPU/VRAM captured ONCE when Cartograph loaded (after icons pinned, before any paint), so the
+	 *  DRAINMEM dGpuSinceLoad / dPhysSinceLoad deltas measure the MAP's render cost - the optimization target.
+	 *  Initialize re-runs on reconnect, so the capture is guarded by the bool. */
+	uint64 InstrLoadBaselinePhysical = 0;
+	uint64 InstrLoadBaselineVRAM = 0;
+	bool bInstrLoadBaselineCaptured = false;
 
 	// -------------------------------------------------------------------------
 	// Scissor mechanism state (SPEC 4.2: reuse the CartographCanvasRenderItem
@@ -319,6 +325,10 @@ private:
 	 *  UObject count, and the running BeginDraw/tile/chunk counters. Phase is a TEXT() literal
 	 *  ("start"/"tick") identifying the sample point. Cheap; called at drain start + every 16 tiles. */
 	void LogDrainMemory(const TCHAR* Phase);
+
+	/** GPU/VRAM bytes in use (engine-tracked texture + buffer memory; a lower bound vs OS VRAM). Game-thread
+	 *  safe. Used for the DRAINMEM UsedGpu / dGpuSinceLoad fields. */
+	static uint64 QueryUsedGpuBytes();
 
 	/**
 	 * COMMITTED Phase-A FALLBACK (SPEC Q3, §4.2): if the persistent target does

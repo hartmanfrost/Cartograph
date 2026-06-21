@@ -7,13 +7,11 @@
 #include "Core/CartographClassDrawTable.h"
 #include "Core/CartographTileManager.h"
 
-// CARTO_LOG / CARTO_LOG_ERROR macros + LogCartograph (matches every sibling new
-// subsystem .cpp). NOTE: this header ALSO re-declares the world-bounds / RENDER_
-// TEXTURE_SIZE constexpr globals that CartographConfig.h supersedes (with a
-// DIFFERENT RENDER_TEXTURE_SIZE: 8192 vs 4096) - an ODR/redefinition conflict in
-// any TU that includes both (this one does, via CartographTypes.h -> Config.h).
-// Reported in contractDeviations; the integration owner must guard/migrate the
-// legacy constants. Logging-only dependency here.
+// CARTO_LOG / CARTO_LOG_ERROR macros + LogCartograph (matches every sibling new subsystem .cpp).
+// (Historical note: an earlier comment here warned of a RENDER_TEXTURE_SIZE 8192-vs-4096 ODR conflict.
+// That is STALE - RENDER_TEXTURE_SIZE is now defined EXACTLY ONCE in CartographConfig.h = 1024*4 = 4096;
+// the legacy 8192 duplicate was deleted, and the whole screen<->world coord chain resolves at 4096. Do
+// not "fix" a non-existent conflict.)
 #include "CartographGameInstanceModule.h"
 
 #include "Algo/StableSort.h"
@@ -37,6 +35,11 @@
 // Core/CoreUObject are already linked (Cartograph.Build.cs), so no Build.cs change.
 #include "HAL/PlatformMemory.h"
 #include "UObject/UObjectArray.h"
+// GPU/VRAM stats for DRAINMEM: the global RHIGetTextureMemoryStats(FTextureMemoryStats&) (FORCEINLINE in
+// DynamicRHI.h, forwards to GDynamicRHI) + GRHIGlobals buffer-memory counters (RHIGlobals.h). RHI is a
+// PrivateDependency in Cartograph.Build.cs, so these link with no Build.cs change.
+#include "DynamicRHI.h"
+#include "RHIGlobals.h"
 
 // =============================================================================
 // CartographCompositor.cpp - Phase-A bounded tiled FCanvas (the TDR fix).
@@ -108,6 +111,21 @@ void FCartographCompositor::Initialize(
 	// Pre-resolve + PIN every distinct icon up front so the per-tile draw loop
 	// never co_awaits AsyncLoadObject mid-pass (SPEC 4.3, sync-texture-load-mid-pass).
 	ResolveAndPinIcons();
+
+	// Capture the GPU/VRAM + host-RAM baseline ONCE, right after Cartograph loaded its fixed resources
+	// (the 64 MB atlas + the pinned icons) but BEFORE any atlas paint, so the DRAINMEM dGpuSinceLoad /
+	// dPhysSinceLoad deltas measure the MAP's rendering cost (the optimization target). Initialize can run
+	// more than once per session (reconnect), so guard it. Log the baseline so the fixed load cost is visible.
+	if (!bInstrLoadBaselineCaptured)
+	{
+		bInstrLoadBaselineCaptured = true;
+		const FPlatformMemoryStats LoadMem = FPlatformMemory::GetStats();
+		InstrLoadBaselinePhysical = LoadMem.UsedPhysical;
+		InstrLoadBaselineVRAM = QueryUsedGpuBytes();
+		const double ToMB = 1.0 / (1024.0 * 1024.0);
+		CARTO_LOG("DRAINMEM baseline (Cartograph loaded) | UsedPhys=%.0fMB UsedGpu=%.0fMB",
+			(double)InstrLoadBaselinePhysical * ToMB, (double)InstrLoadBaselineVRAM * ToMB);
+	}
 }
 
 
@@ -555,18 +573,50 @@ UE5Coro::TCoroutine<> FCartographCompositor::FlushDrainFrame(UE5Coro::TLatentCon
 void FCartographCompositor::LogDrainMemory(const TCHAR* Phase)
 {
 	const FPlatformMemoryStats Mem = FPlatformMemory::GetStats();
+	const uint64 UsedGpu = QueryUsedGpuBytes();
 	const double ToMB = 1.0 / (1024.0 * 1024.0);
 	const double UsedPhysMB = (double)Mem.UsedPhysical * ToMB;
 	const double UsedVirtMB = (double)Mem.UsedVirtual * ToMB;
+	const double UsedGpuMB = (double)UsedGpu * ToMB;
 	const double dPhysMB = ((double)Mem.UsedPhysical - (double)InstrBaselinePhysical) * ToMB;
 	const double dVirtMB = ((double)Mem.UsedVirtual - (double)InstrBaselineVirtual) * ToMB;
+	// Deltas SINCE CARTOGRAPH LOADED (the user-requested anchor: captured at Initialize, before any atlas
+	// paint). dGpuSinceLoad is the GPU/VRAM cost of the whole map; dPhysSinceLoad the host-RAM cost. These
+	// are what optimization targets - the per-drain dPhys/dVirt above are the within-drain growth.
+	const double dPhysSinceLoadMB = ((double)Mem.UsedPhysical - (double)InstrLoadBaselinePhysical) * ToMB;
+	const double dGpuSinceLoadMB = ((double)UsedGpu - (double)InstrLoadBaselineVRAM) * ToMB;
 	const int32 LiveUObjects = GUObjectArray.GetObjectArrayNumMinusAvailable();
 
-	CARTO_LOG("DRAINMEM %s | BeginDraw=%d Drawables=%d Tiles=%d Chunks=%d | UsedPhys=%.0fMB UsedVirt=%.0fMB dPhys=%+.0fMB dVirt=%+.0fMB | UObjects=%d",
+	CARTO_LOG("DRAINMEM %s | BeginDraw=%d Drawables=%d Tiles=%d Chunks=%d | UsedPhys=%.0fMB UsedVirt=%.0fMB dPhys=%+.0fMB dVirt=%+.0fMB | UsedGpu=%.0fMB dGpuSinceLoad=%+.0fMB dPhysSinceLoad=%+.0fMB | UObjects=%d",
 		Phase,
 		InstrBeginDrawCount, InstrDrawablesEmitted, InstrTilesDrawn, InstrChunksEmitted,
 		UsedPhysMB, UsedVirtMB, dPhysMB, dVirtMB,
+		UsedGpuMB, dGpuSinceLoadMB, dPhysSinceLoadMB,
 		LiveUObjects);
+}
+
+
+// -----------------------------------------------------------------------------
+// Proxy for GPU/VRAM bytes in use: engine-tracked texture memory (the 64 MB atlas + 53 pinned icons + the
+// canvas RT) + buffer memory (the FCanvas batched-element vertex/index buffers - the suspected per-draw VRAM
+// consumer). A LOWER BOUND vs the OS VRAM the user measures externally (misses RDG transient reservations,
+// D3D12 heap padding, driver shadow copies) - but the dGpuSinceLoad DELTA tracks the compositor's own growth,
+// which is what guides the memory optimization. Game-thread safe (the engine queries these on the game
+// thread; GRHIGlobals fields are volatile). Prefer the CSS UsedGraphicsMemory field when the platform sets
+// it (vkd3d leaves it 0), else sum the tracked texture + buffer pools.
+// -----------------------------------------------------------------------------
+uint64 FCartographCompositor::QueryUsedGpuBytes()
+{
+	FTextureMemoryStats Tex;
+	RHIGetTextureMemoryStats(Tex);
+	const int64 UsedGfx = Tex.UsedGraphicsMemory;  // CSS field; 0 on vkd3d
+	if (UsedGfx > 0)
+	{
+		return (uint64)UsedGfx;
+	}
+	const uint64 TexBytes = Tex.StreamingMemorySize + Tex.NonStreamingMemorySize;
+	const uint64 BufBytes = (uint64)GRHIGlobals.BufferMemorySize + (uint64)GRHIGlobals.UniformBufferMemorySize;
+	return TexBytes + BufBytes;
 }
 
 
