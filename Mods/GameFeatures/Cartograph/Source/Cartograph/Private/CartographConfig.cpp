@@ -86,14 +86,15 @@ TAutoConsoleVariable<int32> CVarCartographDrainDebounceTicks(
 
 TAutoConsoleVariable<int32> CVarCartographMaxDrawablesPerDrain(
 	TEXT("r.Cartograph.MaxDrawablesPerDrain"),
-	6000,
-	TEXT("LEAK-CALIBRATED SAFETY CAP. Max building drawables EMITTED into the atlas per drain session.\n")
-	TEXT("The megabase OOM growth tracks drawables DRAWN (~0.86 MB each per the DRAINMEM logs), so capping\n")
-	TEXT("drawables bounds the worst case directly: 6000 * 0.86 MB ~= 5 GB over a ~3.9 GB baseline ~= 9 GB,\n")
-	TEXT("safely under the Deck's ~11.8 GB. Unlike a Begin/Draw-call cap, empty tiles (0 drawables) do not\n")
-	TEXT("burn the budget, so the dense base paints. Remaining tiles still drain (just not drawn). If the\n")
-	TEXT("GPU-synced fence holds the memory flat up to this cap, raise/remove it next build. 0 = uncapped.\n")
-	TEXT("Clamped >= 0."),
+	24000,
+	TEXT("RUNAWAY-SAVE CEILING on building drawables EMITTED into the atlas per drain session - NOT a live\n")
+	TEXT("OOM guard (the v2.0.11 RHIThread fence in FlushDrainFrame is). DRAINMEM proved memory is bounded by\n")
+	TEXT("that fence, not by drawable count: UsedGpu stayed flat (1931->1930 MB) across 286->6026 drawables and\n")
+	TEXT("host dPhys plateaued ~+351 MB, NO OOM. The old ~0.86 MB/drawable -> 9 GB projection is OBSOLETE\n")
+	TEXT("post-fence and must NOT be used to re-lower this (doing so truncated the megabase to a top band).\n")
+	TEXT("Default 24000 exceeds a full ~18k-building megabase (~1 drawable/building, tile-straddle-inflated) so\n")
+	TEXT("the whole map paints in one session. On cap-hit the tile is re-marked dirty (slow-but-COMPLETE next\n")
+	TEXT("pass), never dropped permanently blank. 0 = uncapped. Clamped >= 0."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarCartographMaxBeginDrawsPerDrain(

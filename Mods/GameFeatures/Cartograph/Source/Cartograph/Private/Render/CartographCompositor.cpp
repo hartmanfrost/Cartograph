@@ -818,6 +818,17 @@ void FCartographCompositor::EmitTileChunk(FTileId Tile, const TArray<FDrawable>&
 	const int32 MaxDrawables = CVarCartographMaxDrawablesPerDrain.GetValueOnGameThread();
 	if (MaxDrawables > 0 && InstrDrawablesEmitted >= MaxDrawables)
 	{
+		// Cap reached: re-mark this tile dirty (PopDirtyTiles already cleared its bit on pop) so it
+		// repaints on a later drain session instead of being consumed permanently blank. Bumps the
+		// dirty epoch -> the drain re-settles and the remaining tiles paint next pass, so a too-low cap
+		// degrades to slow-but-COMPLETE coverage, never a blank strip. Already-painted tiles are NOT
+		// re-marked, so this converges (each session paints a fresh cap-worth of the remainder). With the
+		// post-fence default (24000 > a full megabase) this path is dormant; it is the backstop that
+		// makes the finite ceiling safe even for a larger base.
+		if (TileManager)
+		{
+			TileManager->MarkDirty(Tile);
+		}
 		return;
 	}
 	// Secondary/legacy BeginDraw-count cap (default OFF). Empty tiles inflate Begin/Draw counts without

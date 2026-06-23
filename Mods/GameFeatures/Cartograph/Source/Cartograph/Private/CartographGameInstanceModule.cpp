@@ -535,6 +535,25 @@ void UCartographGameInstanceModule::InitializeSpine(UWorld* World)
 		if (RenderTarget)
 		{
 			RenderTarget->bAutoGenerateMips = false;
+
+			// Atlas-size invariant (SPEC 4.2). The compositor draws in ABSOLUTE
+			// RENDER_TEXTURE_SIZE pixel space (CartographTypes::WorldToScreen returns
+			// uv * RENDER_TEXTURE_SIZE), but the bundled CanvasRenderTarget_BuildingVisualization
+			// .uasset was authored at 8192 and never re-saved after RENDER_TEXTURE_SIZE was
+			// dropped 8192 -> 4096. On an oversized resource every draw lands in the top-left
+			// RENDER_TEXTURE_SIZE-square quadrant and the map UI (which samples the whole RT)
+			// shows the base squished into the upper-left corner. Resize at runtime so the atlas
+			// always matches the draw space regardless of the asset's saved size (also restores
+			// the intended 256 MB -> 64 MB cut). Must run BEFORE Compositor.Initialize, which
+			// captures + pins the resource. Mirrors the InstanceRenderer init pattern.
+			if (RenderTarget->SizeX != RENDER_TEXTURE_SIZE || RenderTarget->SizeY != RENDER_TEXTURE_SIZE)
+			{
+				CARTO_LOG_ERROR("Atlas RT is %dx%d, expected %dx%d - resizing at runtime (asset is stale; re-save CanvasRenderTarget_BuildingVisualization at %d)",
+					RenderTarget->SizeX, RenderTarget->SizeY, RENDER_TEXTURE_SIZE, RENDER_TEXTURE_SIZE, RENDER_TEXTURE_SIZE);
+				RenderTarget->InitAutoFormat(RENDER_TEXTURE_SIZE, RENDER_TEXTURE_SIZE);
+				RenderTarget->UpdateResourceImmediate(true);
+			}
+
 			Compositor.Initialize(&BuildingStore, &SpatialGrid, &ZBandIndex, &ClassDrawTable, &TileManager, RenderTarget);
 
 			// Start the never-cancelled convergent loop ONCE. It runs until ShutdownSpine
