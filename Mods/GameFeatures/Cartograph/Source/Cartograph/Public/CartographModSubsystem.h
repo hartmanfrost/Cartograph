@@ -49,9 +49,18 @@ private:
 	 *  from Tick so late-joining PCs are picked up. */
 	void EnsureReplicationComponents();
 
+	/** Phase-1 transport probe (r.Cartograph.Net.ProbeAoI). On a client, re-emits a
+	 *  whole-world RequestAoI ~1/s for a bounded window so a pre-Connected (silently
+	 *  buffered) request cannot false-negative. Diagnostic; default-off no-op. */
+	void MaybeDriveAoIProbe();
+
 protected:
 	inline static ACartographModSubsystem* Instance = nullptr;
 
 	/** Throttle for EnsureReplicationComponents / version-push cadence. */
 	float NetAccumulator = 0.f;
+
+	/** Bounded 10 Hz tick counter for the ProbeAoI retry window (reset when the CVar
+	 *  is off, so toggling it 0->1 re-arms the window). */
+	int32 ProbeTickCounter = 0;
 };

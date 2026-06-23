@@ -88,8 +88,10 @@ namespace CartographNet
 	static constexpr int32 InFlightRingDepth = 2;
 
 	/** How many ring entries to release into the transport per net-tick. Keeps the
-	 *  in-flight window shallow (head-of-line mitigation) while still draining. */
-	static constexpr int32 RingDrainPerTick = InFlightRingDepth;
+	 *  in-flight window shallow (head-of-line mitigation) while still draining.
+	 *  Superseded at runtime by r.Cartograph.Net.RingDrainPerTick (this is the
+	 *  documented default it mirrors); [[maybe_unused]] now that the read is the CVar. */
+	[[maybe_unused]] static constexpr int32 RingDrainPerTick = InFlightRingDepth;
 
 	/** Hard cap on records packed into a single tile blob. A tile is one render
 	 *  cell; in practice occupancy is small, but this bounds a single by-value
@@ -536,7 +538,10 @@ namespace
 		// ack, so we drain a fixed small count per tick rather than "refill the ring
 		// on ack of the oldest". Validate this keeps head-of-line blocking acceptable
 		// under join + belt-drag (SPEC 4.4 Q9); if not, an ack hook is required.
-		const int32 Window = FMath::Min(CartographNet::RingDrainPerTick, State.InFlightRing.Num());
+		// Live-tunable drain count (Phase-3 SPIKE Q9 pacing); defaults to the prior
+		// constexpr InFlightRingDepth. Clamped >= 1.
+		const int32 RingDrain = FMath::Max(1, CVarCartographNetRingDrainPerTick.GetValueOnGameThread());
+		const int32 Window = FMath::Min(RingDrain, State.InFlightRing.Num());
 		for (int32 Sent = 0; Sent < Window; ++Sent)
 		{
 			const FTileId Tile = State.InFlightRing[0];
@@ -547,7 +552,9 @@ namespace
 			// Copy the immutable shared blob into the by-value send buffer. This is
 			// the single per-connection materialization the ring bounds.
 			TArray<uint8> SendBuffer = *Snapshot->Blob;
+			const int32 BlobBytes = SendBuffer.Num();
 			Transport->SendTaggedMessage(CartographNetTags::Tile(), MoveTemp(SendBuffer));
+			CARTO_NET_LOG("DrainInFlightRing: sent tile %u (%d bytes); ring remaining %d", (uint32)Tile, BlobBytes, State.InFlightRing.Num());
 
 			// Record what version this client now holds so PushPendingDeltas can diff
 			// against the live version next tick without an external queue.
@@ -843,6 +850,20 @@ void UCartographMapReplicationComponent::InitializeTransport()
 	}
 	State.Transport = Transport;
 
+	// SPIKE(Q1) PROBE: log whether each mod-owned native tag resolves BY NAME via the
+	// registry on this peer - the ReliableMessaging protocol reader rejects a tag whose
+	// name does not resolve on the receiving side, so a NO here on either end explains a
+	// silently-dropped message (tag-rejection, distinct from a dead transport).
+	{
+		const TCHAR* Role = OwningPC->HasAuthority() ? TEXT("server") : TEXT("client");
+		const FGameplayTag Tags[] = { CartographNetTags::Manifest(), CartographNetTags::Tile(), CartographNetTags::Version(), AoITag() };
+		for (const FGameplayTag& T : Tags)
+		{
+			const FGameplayTag Resolved = FGameplayTag::RequestGameplayTag(T.GetTagName(), /*ErrorIfNotFound*/ false);
+			CARTO_NET_LOG("Tag '%s' resolves=%s (role=%s)", *T.GetTagName().ToString(), Resolved.IsValid() ? TEXT("YES") : TEXT("NO"), Role);
+		}
+	}
+
 	// Register the mod-owned handlers. The SAME component carries all four fixed
 	// tags; the role (client vs server) determines which fire. Binding both sides'
 	// handlers is harmless because the wrong-role tags never arrive.
@@ -889,6 +910,7 @@ void UCartographMapReplicationComponent::RequestAoI(const FBox2f& ScreenViewport
 	// to send; the host renders from its own indices.
 	if (!Transport)
 	{
+		CARTO_NET_LOG_WARNING("RequestAoI: no transport bound (listen host/SP, or GetFromPlayer failed - SPIKE Q1) - no-op");
 		return;
 	}
 
@@ -910,11 +932,16 @@ void UCartographMapReplicationComponent::RequestAoI(const FBox2f& ScreenViewport
 	// SendTaggedMessage takes the payload BY VALUE (verified). This AoI request is
 	// tiny (17 bytes), so the by-value cost is negligible.
 	Transport->SendTaggedMessage(AoITag(), MoveTemp(Payload));
+	CARTO_NET_LOG("RequestAoI: handed whole-world/viewport AoI to transport [%.0f,%.0f]-[%.0f,%.0f] (separates 'mod never sent' from 'sent but lost')",
+		ScreenViewportBox.Min.X, ScreenViewportBox.Min.Y, ScreenViewportBox.Max.X, ScreenViewportBox.Max.Y);
 }
 
 void UCartographMapReplicationComponent::OnTileReceived(FGameplayTag Tag, TArray<uint8>&& Payload)
 {
 	FComponentState& State = GetComponentState(this);
+
+	// SPIKE(Q1) round-trip PASS marker (client side): a tile blob actually arrived.
+	CARTO_NET_LOG("OnTileReceived: tile blob arrived on client (%d bytes) - transport round-trip CONFIRMED", Payload.Num());
 
 	// The handler receives the completed tile blob by RVALUE-REF (move, per SPEC 5
 	// step 4) - we never copy the inbound bytes.
@@ -1138,6 +1165,9 @@ void UCartographMapReplicationComponent::OnAoIRequested(FGameplayTag Tag, TArray
 	FComponentState& State = GetComponentState(this);
 	UReliableMessagingPlayerComponent* Transport = State.Transport.Get();
 
+	// SPIKE(Q1) round-trip marker (server side): the client's AoI request reached us.
+	CARTO_NET_LOG("OnAoIRequested: AoI request reached server (%d bytes) - client->server leg CONFIRMED", Payload.Num());
+
 	if (!State.ServerReplicator || !Transport)
 	{
 		CARTO_NET_LOG_WARNING("AoI request received with no bound server replicator / transport");
@@ -1170,6 +1200,7 @@ void UCartographMapReplicationComponent::OnAoIRequested(FGameplayTag Tag, TArray
 	TArray<FTileId> ManifestTiles;
 	TArray<FTileVersion> ManifestVersions;
 	State.ServerReplicator->BuildManifest(State.ServerClientAoI, ManifestTiles, ManifestVersions);
+	CARTO_NET_LOG("OnAoIRequested: built manifest of %d populated tiles; sending manifest + seeding distance-ordered ring", ManifestTiles.Num());
 
 	{
 		TArray<uint8> ManifestPayload;

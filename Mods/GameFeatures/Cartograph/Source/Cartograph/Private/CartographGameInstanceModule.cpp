@@ -394,7 +394,34 @@ void UCartographGameInstanceModule::DispatchLifecycleEvent(ELifecyclePhase Phase
 			ShouldInitialize = false;
 			IsInitializing = true;
 			InitializeSpine(GetWorld());
-			GatherCoroutine = StreamingGather();
+
+			if (CVarCartographNetConsumeReplicated.GetValueOnGameThread() > 0)
+			{
+				// Phase 2 (CVar-gated): consume the server's per-tile Cartograph stream
+				// instead of the local whole-world gather. The compositor is already
+				// started above; ask the server for the whole-world AoI and the tiles
+				// arrive distance-ordered, each MarkDirty'ing as it applies so the paint
+				// converges progressively - no ~18k-building local StreamingGather + one-
+				// burst render (the host-RAM/game-thread saturation that crashed at ~70%).
+				const FBox2f WholeWorldBox(FVector2f(0.f, 0.f), FVector2f((float)RENDER_TEXTURE_SIZE, (float)RENDER_TEXTURE_SIZE));
+				if (UCartographMapReplicationComponent* ReplComp = PlayerController->FindComponentByClass<UCartographMapReplicationComponent>())
+				{
+					ReplComp->RequestAoI(WholeWorldBox);
+					CARTO_LOG("ConsumeReplicated: requested whole-world AoI from server (skipping local StreamingGather)");
+				}
+				else
+				{
+					// The per-PC component is attached by the 10 Hz ModSubsystem poll; if it
+					// is not present yet, r.Cartograph.Net.ProbeAoI re-drives the request.
+					CARTO_LOG_WARNING("ConsumeReplicated: no replication component on PC yet; AoI will be driven by the subsystem/probe");
+				}
+			}
+			else
+			{
+				// Default (ConsumeReplicated=0): the proven local whole-world gather. This
+				// is the host/listen path AND the dedicated-client safety net.
+				GatherCoroutine = StreamingGather();
+			}
         };
 
 

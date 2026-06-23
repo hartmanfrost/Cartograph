@@ -228,6 +228,30 @@ extern TAutoConsoleVariable<int32> CVarCartographMaxDrawablesPerDrain;
 extern TAutoConsoleVariable<int32> CVarCartographFlushAfterNDraws;
 
 
+/**
+ * r.Cartograph.Net.ProbeAoI (int, default 0). TEMP Phase-1 transport probe. When 1 on a
+ * dedicated client, the mod subsystem re-emits a whole-world RequestAoI ~1/s for ~15 s so a
+ * pre-Connected (silently buffered) request cannot false-negative. PASS = server OnAoIRequested
+ * AND client OnTileReceived both appear in the LogCartographNet trace. Toggle 0->1 to re-arm.
+ */
+extern TAutoConsoleVariable<int32> CVarCartographNetProbeAoI;
+
+/**
+ * r.Cartograph.Net.ConsumeReplicated (int, default 0). When 1 on a dedicated client, consume the
+ * server's per-tile stream instead of the local whole-world StreamingGather (removes the ~18k
+ * gather + one-burst render that caused the ~70% crash). 0 = the proven StreamingGather path
+ * (also host/listen + client safety net). Gated OFF until the Q1 transport is verified.
+ */
+extern TAutoConsoleVariable<int32> CVarCartographNetConsumeReplicated;
+
+/**
+ * r.Cartograph.Net.RingDrainPerTick (int, default 2). Server-side per-net-tick in-flight ring
+ * drain count (head-of-line mitigation, SPEC 4.4 Q9). Live-tunable join pacing without a rebuild.
+ * Clamped >= 1.
+ */
+extern TAutoConsoleVariable<int32> CVarCartographNetRingDrainPerTick;
+
+
 // -----------------------------------------------------------------------------
 // Convenience accessors (inline, header-safe).
 // -----------------------------------------------------------------------------

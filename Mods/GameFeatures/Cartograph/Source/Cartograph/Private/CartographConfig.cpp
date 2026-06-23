@@ -135,3 +135,41 @@ TAutoConsoleVariable<int32> CVarCartographDrainMaxWaitTicks(
 	TEXT("60 fps / ~5 min at 30 fps - past any realistic stream-in. Normal play settles via the\n")
 	TEXT("0.5 s debounce long before this; this is only a theoretical anti-starvation floor. Clamped >= 1."),
 	ECVF_Default);
+
+// -----------------------------------------------------------------------------
+// Server->client tile streaming (SPEC 4.4 net path). All default OFF: with both
+// ProbeAoI=0 and ConsumeReplicated=0 the client behaves byte-identically to the
+// local-StreamingGather path (the proven host + client-safety path is unchanged).
+// -----------------------------------------------------------------------------
+TAutoConsoleVariable<int32> CVarCartographNetProbeAoI(
+	TEXT("r.Cartograph.Net.ProbeAoI"),
+	0,
+	TEXT("TEMP transport probe (Phase-1 Q1 validation). When 1 on a dedicated CLIENT, the mod\n")
+	TEXT("subsystem re-emits a whole-world RequestAoI ~once/second for a bounded ~15 s window so a\n")
+	TEXT("single pre-Connected request (silently buffered by ReliableMessaging, which exposes no\n")
+	TEXT("is-connected query) cannot yield a false negative. PASS = a completed round-trip in the\n")
+	TEXT("LogCartographNet trace: server OnAoIRequested AND client OnTileReceived both fire. Toggle\n")
+	TEXT("0->1 to re-arm the window. Diagnostic only; remove once the transport is proven. 0 = off."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarCartographNetConsumeReplicated(
+	TEXT("r.Cartograph.Net.ConsumeReplicated"),
+	0,
+	TEXT("When 1 on a dedicated CLIENT, consume the server's per-tile Cartograph stream instead of\n")
+	TEXT("locally gathering the whole world (StreamingGather). On join the client starts its\n")
+	TEXT("compositor and sends a whole-world AoI; the server streams populated tiles distance-ordered\n")
+	TEXT("and each applies + MarkDirty so the compositor paints progressively. This removes the\n")
+	TEXT("~18k-building local gather + one-burst render that saturated host RAM and the game thread\n")
+	TEXT("(the ~70% first-paint crash). 0 = the proven local StreamingGather path (default, also the\n")
+	TEXT("host/listen path and the client safety net). Gated OFF until the Q1 transport is verified."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarCartographNetRingDrainPerTick(
+	TEXT("r.Cartograph.Net.RingDrainPerTick"),
+	2,
+	TEXT("Server-side: how many per-tile blobs the in-flight ring releases into the ReliableMessaging\n")
+	TEXT("FIFO per net-tick (10 Hz). Bounds the materialized by-value send buffers (head-of-line\n")
+	TEXT("mitigation, SPEC 4.4 Q9). Live-tunable so a ~18k-tile join can be paced without a rebuild:\n")
+	TEXT("raise to drain the AoI faster, lower if the FIFO head-of-line-blocks under join + belt-drag.\n")
+	TEXT("Default 2 (the prior constexpr InFlightRingDepth). Clamped >= 1."),
+	ECVF_Default);
